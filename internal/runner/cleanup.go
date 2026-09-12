@@ -156,7 +156,7 @@ func cleanupEntry(ctx context.Context, base, name string) (string, error) {
 			}
 		}
 	}
-	if err := removeWorktree(ctx, root); err != nil {
+	if err := removeWorktree(root); err != nil {
 		return "", err
 	}
 	return o.ID, nil
@@ -188,17 +188,9 @@ func sessionGroups(ctx context.Context, id string) ([]int, error) {
 	return groups, nil
 }
 
-func removeWorktree(ctx context.Context, root string) error {
-	bare := filepath.Join(root, "repo.git")
-	checkout := filepath.Join(root, "checkout")
-	if _, err := os.Stat(checkout); err == nil {
-		// Interrupted setup may leave an unregistered checkout. Both the bare
-		// repository and checkout belong to this disposable root, so removing
-		// that root also removes any incomplete internal Git metadata.
-		_, _ = git(ctx, bare, "worktree", "remove", "--force", "--force", checkout)
-	} else if !os.IsNotExist(err) {
-		return err
-	}
+func removeWorktree(root string) error {
+	// The bare repository, worktree registration, and checkout all belong to
+	// this disposable root, including any incomplete setup artifacts.
 	if err := os.RemoveAll(root); err != nil {
 		return err
 	}
