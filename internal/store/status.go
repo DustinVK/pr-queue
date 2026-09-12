@@ -1,6 +1,11 @@
 package store
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+)
 
 type RunStatus struct {
 	ID         string  `json:"id"`
@@ -13,22 +18,33 @@ type RunStatus struct {
 }
 
 func (s *Store) LastRuns(ctx context.Context) ([]RunStatus, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, repo, number, status, started_at, finished_at, error FROM (
- SELECT r.id, p.repo, p.number, r.status, r.started_at, r.finished_at, r.error,
- ROW_NUMBER() OVER (PARTITION BY p.repo ORDER BY r.started_at DESC, r.id DESC) AS rank
+	// Existing databases can contain variable-width RFC3339 fractions. SQLite's
+	// date functions lose nanosecond precision, so compare parsed instants here.
+	rows, err := s.DB.QueryContext(ctx, `SELECT r.id, p.repo, p.number, r.status, r.started_at, r.finished_at, r.error
  FROM review_runs r JOIN pull_requests p ON p.id = r.pr_id
-) WHERE rank = 1 ORDER BY repo`)
+ ORDER BY p.repo`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	result := []RunStatus{}
+	var latest time.Time
 	for rows.Next() {
 		var r RunStatus
 		if err := rows.Scan(&r.ID, &r.Repo, &r.PR, &r.Status, &r.StartedAt, &r.FinishedAt, &r.Error); err != nil {
 			return nil, err
 		}
-		result = append(result, r)
+		started, err := time.Parse(time.RFC3339Nano, r.StartedAt)
+		if err != nil {
+			return nil, fmt.Errorf("run %s started_at: %w", r.ID, err)
+		}
+		if len(result) == 0 || !strings.EqualFold(result[len(result)-1].Repo, r.Repo) {
+			result = append(result, r)
+			latest = started
+		} else if started.After(latest) || (started.Equal(latest) && r.ID > result[len(result)-1].ID) {
+			result[len(result)-1] = r
+			latest = started
+		}
 	}
 	return result, rows.Err()
 }
