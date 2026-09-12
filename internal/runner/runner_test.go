@@ -173,6 +173,28 @@ func testRunner(t *testing.T, mode string, timeout time.Duration) Runner {
 	return Runner{StateDir: t.TempDir(), Agent: config.Agent{Executable: os.Args[0], Timeout: timeout}}
 }
 
+func TestResolveExecutableMakesRelativeWrapperAbsolute(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(t.TempDir(), "wrapper with spaces")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(wd, wrapper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolveExecutable(relative)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != wrapper || !filepath.IsAbs(resolved) {
+		t.Fatalf("resolved %q, want %q", resolved, wrapper)
+	}
+}
+
 func TestRunnerWritesContractAndRemovesDetachedWorktree(t *testing.T) {
 	req, source := localFixture(t)
 	r := testRunner(t, "success", 10*time.Second)

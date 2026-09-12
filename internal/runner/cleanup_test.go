@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DustinVK/pr-queue/internal/config"
 	"github.com/google/uuid"
 )
 
@@ -107,7 +108,7 @@ func TestCleanupLeavesUnidentifiedAgentGroupsAlone(t *testing.T) {
 }
 
 func TestCleanupInterruptedBeforeAgentPIDSaved(t *testing.T) {
-	r := Runner{StateDir: t.TempDir()}
+	r := Runner{StateDir: t.TempDir(), Agent: config.Agent{Provider: config.ProviderCodex}}
 	id := uuid.NewString()
 	root := filepath.Join(r.StateDir, "worktrees", id)
 	if err := os.MkdirAll(filepath.Join(root, "checkout"), 0700); err != nil {
@@ -166,6 +167,83 @@ func TestCleanupInterruptedBeforeAgentPIDSaved(t *testing.T) {
 	for _, path := range []string{root, ownerPath(root)} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("recovery artifact remains at %s: %v", path, err)
+		}
+	}
+}
+
+func TestCleanupLegacySavedAgentWhileCodexConfigured(t *testing.T) {
+	r := Runner{StateDir: t.TempDir(), Agent: config.Agent{Provider: config.ProviderCodex}}
+	id := uuid.NewString()
+	root := filepath.Join(r.StateDir, "worktrees", id)
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/bin/sh", "-c", "exec sleep 60")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	t.Cleanup(func() {
+		if !waited {
+			_ = killGroup(cmd.Process.Pid)
+			_ = cmd.Wait()
+		}
+	})
+	stamp, err := processStart(t.Context(), cmd.Process.Pid)
+	if err != nil || stamp == "" {
+		t.Fatalf("identify fixture: %q %v", stamp, err)
+	}
+	o, err := newOwner(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.Version = 0
+	o.Started = "previous coordinator"
+	o.AgentPID = cmd.Process.Pid
+	o.AgentStart = stamp
+	if err := saveOwner(root, o); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := r.Cleanup(t.Context())
+	if err != nil || len(cleaned) != 1 || cleaned[0] != id {
+		t.Fatalf("legacy saved PID cleanup: %v %v", cleaned, err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("legacy owned agent was not terminated")
+	}
+	waited = true
+}
+
+func TestCleanupRejectsMalformedVersion2OwnershipBeforeLiveOwnerCheck(t *testing.T) {
+	for _, mutate := range []func(*owner){
+		func(o *owner) { o.Version = 3 },
+		func(o *owner) { o.AgentPID = -1 },
+		func(o *owner) { o.AgentPID = 1 },
+		func(o *owner) { o.AgentStart = "unexpected" },
+		func(o *owner) { o.Released = true },
+		func(o *owner) { o.Starting = true },
+	} {
+		r := Runner{StateDir: t.TempDir()}
+		id := uuid.NewString()
+		root := filepath.Join(r.StateDir, "worktrees", id)
+		if err := os.MkdirAll(root, 0700); err != nil {
+			t.Fatal(err)
+		}
+		o, err := newOwner(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mutate(&o)
+		if err := saveOwner(root, o); err != nil {
+			t.Fatal(err)
+		}
+		cleaned, err := r.Cleanup(t.Context())
+		if err == nil || len(cleaned) != 0 {
+			t.Fatalf("malformed owner accepted: %+v, cleaned=%v err=%v", o, cleaned, err)
+		}
+		if _, err := os.Stat(ownerPath(root)); err != nil {
+			t.Fatal("malformed ownership evidence removed:", err)
 		}
 	}
 }

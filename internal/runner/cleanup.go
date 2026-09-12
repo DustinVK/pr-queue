@@ -128,6 +128,9 @@ func cleanupEntry(ctx context.Context, base, name string) (string, error) {
 	if o.ID != id || o.PID < 1 || o.Started == "" || (o.Version != 0 && o.Version != 2) {
 		return "", fmt.Errorf("invalid worktree ownership for %s", name)
 	}
+	if err := validateAgentOwnership(o); err != nil {
+		return "", fmt.Errorf("invalid worktree ownership for %s: %w", name, err)
+	}
 	stamp, err := processStart(ctx, o.PID)
 	if err != nil {
 		return "", err
@@ -184,6 +187,25 @@ func cleanupEntry(ctx context.Context, base, name string) (string, error) {
 		return "", err
 	}
 	return o.ID, nil
+}
+
+func validateAgentOwnership(o owner) error {
+	if o.Version != 2 {
+		return nil
+	}
+	if o.Starting {
+		return fmt.Errorf("version 2 owner contains legacy starting state")
+	}
+	if o.AgentPID == 0 {
+		if o.AgentStart != "" || o.Released {
+			return fmt.Errorf("agent identity is incomplete")
+		}
+		return nil
+	}
+	if o.AgentPID < 2 || o.AgentStart == "" {
+		return fmt.Errorf("agent identity is incomplete")
+	}
+	return nil
 }
 
 func sessionGroups(ctx context.Context, id string) ([]int, error) {
