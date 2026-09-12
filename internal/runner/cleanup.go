@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -88,61 +89,75 @@ func (r Runner) Cleanup(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	var cleaned []string
+	var problems []error
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".owner.json") {
 			continue
 		}
-		id := strings.TrimSuffix(entry.Name(), ".owner.json")
-		if _, err := uuid.Parse(id); err != nil {
-			return cleaned, fmt.Errorf("unexpected worktree ownership file %s", entry.Name())
-		}
-		root := filepath.Join(base, id)
-		data, err := os.ReadFile(ownerPath(root))
+		id, err := cleanupEntry(ctx, base, entry.Name())
 		if err != nil {
-			return cleaned, err
-		}
-		var o owner
-		if err := json.Unmarshal(data, &o); err != nil {
-			return cleaned, err
-		}
-		if o.ID != id || o.PID < 1 || o.Started == "" {
-			return cleaned, fmt.Errorf("invalid worktree ownership for %s", entry.Name())
-		}
-		stamp, err := processStart(ctx, o.PID)
-		if err != nil {
-			return cleaned, err
-		}
-		if stamp != "" && stamp == o.Started {
+			problems = append(problems, fmt.Errorf("recover %s: %w", entry.Name(), err))
 			continue
 		}
-		if o.Starting {
-			// Cover a coordinator killed between Start and saving the child PID.
-			groups, err := sessionGroups(ctx, o.ID)
-			if err != nil {
-				return cleaned, err
-			}
-			for _, pid := range groups {
-				if err := killGroup(pid); err != nil {
-					return cleaned, err
-				}
-			}
-		} else if o.AgentPID > 1 {
-			stamp, err := processStart(ctx, o.AgentPID)
-			if err != nil {
-				return cleaned, err
-			}
-			if stamp == "" || stamp == o.AgentStart {
-				if err := killGroup(o.AgentPID); err != nil {
-					return cleaned, err
-				}
-			}
+		if id != "" {
+			cleaned = append(cleaned, id)
 		}
-		if err := removeWorktree(ctx, root); err != nil {
-			return cleaned, err
-		}
-		cleaned = append(cleaned, o.ID)
 	}
-	return cleaned, nil
+	return cleaned, errors.Join(problems...)
+}
+
+// Each ownership entry is independent; one failure must not leave other
+// recoverable worktrees or agent groups behind. Errors still block a new run.
+func cleanupEntry(ctx context.Context, base, name string) (string, error) {
+	id := strings.TrimSuffix(name, ".owner.json")
+	if _, err := uuid.Parse(id); err != nil {
+		return "", fmt.Errorf("unexpected worktree ownership file %s", name)
+	}
+	root := filepath.Join(base, id)
+	data, err := os.ReadFile(ownerPath(root))
+	if err != nil {
+		return "", err
+	}
+	var o owner
+	if err := json.Unmarshal(data, &o); err != nil {
+		return "", err
+	}
+	if o.ID != id || o.PID < 1 || o.Started == "" {
+		return "", fmt.Errorf("invalid worktree ownership for %s", name)
+	}
+	stamp, err := processStart(ctx, o.PID)
+	if err != nil {
+		return "", err
+	}
+	if stamp != "" && stamp == o.Started {
+		return "", nil
+	}
+	if o.Starting {
+		// Cover a coordinator killed between Start and saving the child PID.
+		groups, err := sessionGroups(ctx, o.ID)
+		if err != nil {
+			return "", err
+		}
+		for _, pid := range groups {
+			if err := killGroup(pid); err != nil {
+				return "", err
+			}
+		}
+	} else if o.AgentPID > 1 {
+		stamp, err := processStart(ctx, o.AgentPID)
+		if err != nil {
+			return "", err
+		}
+		if stamp == "" || stamp == o.AgentStart {
+			if err := killGroup(o.AgentPID); err != nil {
+				return "", err
+			}
+		}
+	}
+	if err := removeWorktree(ctx, root); err != nil {
+		return "", err
+	}
+	return o.ID, nil
 }
 
 func sessionGroups(ctx context.Context, id string) ([]int, error) {
