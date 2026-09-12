@@ -85,6 +85,22 @@ func fakeAgent(mode string) int {
 			return 46
 		}
 	}
+	if mode == "git-context" {
+		for _, check := range []struct {
+			args []string
+			want string
+		}{
+			{[]string{"rev-parse", "HEAD"}, input.HeadSHA},
+			{[]string{"status", "--porcelain=v1"}, ""},
+			{[]string{"config", "--get", "prqueue.testglobal"}, "preserved"},
+		} {
+			out, err := exec.Command("git", check.args...).CombinedOutput()
+			if err != nil || strings.TrimSpace(string(out)) != check.want {
+				fmt.Fprintf(os.Stderr, "agent git %v: %q %v; want %q\n", check.args, out, err, check.want)
+				return 47
+			}
+		}
+	}
 	d := findings.Document{SchemaVersion: 1, Repo: input.Repo, PR: input.PR, HeadSHA: input.HeadSHA, Summary: "Synthetic review", Verdict: "comment", Findings: []findings.Finding{}}
 	data, err := json.Marshal(d)
 	if err != nil {

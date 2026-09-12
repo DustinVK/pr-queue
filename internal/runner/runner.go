@@ -225,7 +225,7 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 
 func agentEnv(output string, input findings.Input) []string {
 	var env []string
-	for _, v := range os.Environ() {
+	for _, v := range repositoryEnv() {
 		key, _, _ := strings.Cut(v, "=")
 		if key == "GH_TOKEN" || key == "GITHUB_TOKEN" || key == "GH_ENTERPRISE_TOKEN" || key == "GITHUB_ENTERPRISE_TOKEN" || strings.HasPrefix(key, "PRQUEUE_") {
 			continue
@@ -234,6 +234,29 @@ func agentEnv(output string, input findings.Input) []string {
 	}
 	data, _ := json.Marshal(input)
 	return append(env, "PRQUEUE_OUTPUT="+output, "PRQUEUE_INPUT="+string(data))
+}
+
+// A hook or caller may export context for its own repository. Neither Git nor
+// the agent should carry that context into the disposable review checkout.
+// Keep global configuration and transport/authentication settings available.
+func repositoryEnv() []string {
+	var env []string
+	for _, v := range os.Environ() {
+		key, _, _ := strings.Cut(v, "=")
+		switch key {
+		case "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+			"GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE",
+			"GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE",
+			"GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+			"GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM":
+			continue
+		}
+		if strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+			continue
+		}
+		env = append(env, v)
+	}
+	return env
 }
 
 func killGroup(pid int) error {
@@ -253,7 +276,7 @@ func git(ctx context.Context, bare string, args ...string) ([]byte, error) {
 		fixed = append(fixed, "--git-dir", bare)
 	}
 	cmd := exec.CommandContext(ctx, "git", append(fixed, args...)...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(repositoryEnv(), "GIT_TERMINAL_PROMPT=0")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return killGroup(cmd.Process.Pid) }
 	cmd.WaitDelay = 2 * time.Second
