@@ -24,6 +24,7 @@ type GitHub struct {
 	User string `yaml:"user" json:"user"`
 }
 type Agent struct {
+	Provider           string        `yaml:"provider" json:"provider"`
 	Executable         string        `yaml:"executable" json:"executable"`
 	Timeout            time.Duration `yaml:"timeout" json:"timeout"`
 	MaxParallelReviews int           `yaml:"max_parallel_reviews" json:"max_parallel_reviews"`
@@ -38,9 +39,15 @@ type Filters struct {
 	BaseBranches      []string `yaml:"base_branches" json:"base_branches"`
 }
 
+const (
+	ProviderClaude = "claude"
+	ProviderCodex  = "codex"
+)
+
 const DefaultYAML = `github:
   user: your-login
 agent:
+  provider: claude
   executable: claude
   timeout: 15m
   max_parallel_reviews: 1
@@ -49,7 +56,7 @@ repos: []
 `
 
 func Defaults() Config {
-	return Config{Agent: Agent{Executable: "claude", Timeout: 15 * time.Minute, MaxParallelReviews: 1}, Repos: []Repo{}}
+	return Config{Agent: Agent{Provider: ProviderClaude, Executable: ProviderClaude, Timeout: 15 * time.Minute, MaxParallelReviews: 1}, Repos: []Repo{}}
 }
 
 func Load(path string) (Config, error) {
@@ -61,7 +68,20 @@ func Load(path string) (Config, error) {
 }
 
 func Parse(data []byte) (Config, error) {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return Config{}, fmt.Errorf("decode config: %w", err)
+	}
+	agentFields := mappingFields(mappingValue(document.Content, "agent"))
 	c := Defaults()
+	if _, present := agentFields["provider"]; present {
+		c.Agent.Provider = ""
+	}
+	if _, present := agentFields["executable"]; present {
+		c.Agent.Executable = ""
+	} else if provider := scalarValue(agentFields["provider"]); provider != "" {
+		c.Agent.Executable = provider
+	}
 	d := yaml.NewDecoder(bytes.NewReader(data))
 	d.KnownFields(true)
 	if err := d.Decode(&c); err != nil {
@@ -75,7 +95,75 @@ func Parse(data []byte) (Config, error) {
 	default:
 		return c, fmt.Errorf("decode config: %w", err)
 	}
+	if node, present := agentFields["provider"]; present && (node.Tag == "!!null" || strings.TrimSpace(node.Value) == "") {
+		return c, fmt.Errorf("agent.provider must be claude or codex")
+	}
+	if node, present := agentFields["executable"]; present && (node.Tag == "!!null" || strings.TrimSpace(node.Value) == "") {
+		return c, fmt.Errorf("agent.executable must name an executable")
+	}
+	normalized, err := c.Agent.Normalized()
+	if err != nil {
+		return c, err
+	}
+	c.Agent = normalized
 	return c, c.Validate()
+}
+
+func mappingValue(nodes []*yaml.Node, key string) []*yaml.Node {
+	if len(nodes) == 0 {
+		return nil
+	}
+	n := nodes[0]
+	if n.Kind == yaml.DocumentNode && len(n.Content) == 1 {
+		n = n.Content[0]
+	}
+	if n.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == key {
+			return []*yaml.Node{n.Content[i+1]}
+		}
+	}
+	return nil
+}
+
+func mappingFields(nodes []*yaml.Node) map[string]*yaml.Node {
+	fields := make(map[string]*yaml.Node)
+	if len(nodes) == 0 || nodes[0].Kind != yaml.MappingNode {
+		return fields
+	}
+	for i := 0; i+1 < len(nodes[0].Content); i += 2 {
+		fields[nodes[0].Content[i].Value] = nodes[0].Content[i+1]
+	}
+	return fields
+}
+
+func scalarValue(n *yaml.Node) string {
+	if n == nil || n.Kind != yaml.ScalarNode || n.Tag == "!!null" {
+		return ""
+	}
+	return n.Value
+}
+
+// Normalized applies compatibility defaults for callers that construct Agent directly.
+func (a Agent) Normalized() (Agent, error) {
+	if a.Provider == "" {
+		a.Provider = ProviderClaude
+	}
+	if a.Provider != ProviderClaude && a.Provider != ProviderCodex {
+		return a, fmt.Errorf("agent.provider must be claude or codex")
+	}
+	if a.Executable == "" {
+		a.Executable = a.Provider
+	}
+	if strings.TrimSpace(a.Executable) == "" || strings.ContainsAny(a.Executable, "\x00\r\n") {
+		return a, fmt.Errorf("agent.executable must name an executable")
+	}
+	if a.Timeout <= 0 {
+		return a, fmt.Errorf("agent.timeout must be positive")
+	}
+	return a, nil
 }
 
 var loginPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
@@ -118,11 +206,8 @@ func (c Config) Validate() error {
 	if !ValidLogin(c.GitHub.User) {
 		return fmt.Errorf("github.user must be a GitHub login")
 	}
-	if strings.TrimSpace(c.Agent.Executable) == "" || strings.ContainsAny(c.Agent.Executable, "\x00\r\n") {
-		return fmt.Errorf("agent.executable must name an executable")
-	}
-	if c.Agent.Timeout <= 0 {
-		return fmt.Errorf("agent.timeout must be positive")
+	if _, err := c.Agent.Normalized(); err != nil {
+		return err
 	}
 	if c.Agent.MaxParallelReviews < 1 {
 		return fmt.Errorf("agent.max_parallel_reviews must be positive")
