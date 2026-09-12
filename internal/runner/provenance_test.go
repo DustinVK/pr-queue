@@ -1,10 +1,13 @@
 package runner
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/DustinVK/pr-queue/internal/config"
 )
 
 func TestAgentMetadataLifecycleAndPrivateWrite(t *testing.T) {
@@ -48,6 +51,15 @@ func TestAgentMetadataLifecycleAndPrivateWrite(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0600 {
 		t.Fatalf("mode = %o", info.Mode().Perm())
+	}
+}
+
+func TestObservedIdentityReaderIsBounded(t *testing.T) {
+	line := []byte("{\"type\":\"other\"}\n")
+	tooLate := bytes.Repeat(line, maxObservedIdentityBytes/len(line)+1)
+	tooLate = append(tooLate, []byte("{\"type\":\"thread.started\",\"thread_id\":\"too-late\"}\n")...)
+	if got := ObservedIdentityFromJSONLReader(config.ProviderCodex, bytes.NewReader(tooLate)); got != nil {
+		t.Fatalf("identity beyond diagnostic bound = %#v", got)
 	}
 }
 
