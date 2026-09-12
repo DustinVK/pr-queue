@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dustinvk.prqueue</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/prq</string>
+    <string>run</string>
+  </array>
+
+  <!-- Optional scheduling example; not installed by prq init.
+       Adjust ProgramArguments to the absolute path of your installed binary.
+       The interval belongs to launchd; prq itself has no poll_interval setting.
+       Interval firings during sleep or an existing run are skipped. -->
+  <key>StartInterval</key>
+  <integer>120</integer>
+
+  <!-- Load as a user LaunchAgent in your GUI session. Notification delivery
+       still depends on macOS permissions. Configure PATH for git, gh, the
+       agent, and terminal-notifier if their directories are not inherited.
+       Replace YOUR-USER in both log paths with your account name; launchd
+       does not expand ~. Before loading, create the private state directory:
+       mkdir -p "$HOME/.local/state/prqueue"
+       chmod 700 "$HOME/.local/state/prqueue" -->
+  <!-- Decimal 63 is octal 077: newly created logs are private. -->
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR-USER/.local/state/prqueue/prqueue.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR-USER/.local/state/prqueue/prqueue.log</string>
+
+  <!-- Do not run immediately when this job is loaded. RunAtLoad does not
+       implement a battery policy or control wake-from-sleep behavior. -->
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
