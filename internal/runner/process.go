@@ -36,6 +36,8 @@ func (e *launchCleanupError) Error() string { return "clean up failed agent laun
 func (e *launchCleanupError) Unwrap() error { return e.err }
 
 func newGatedProcess(ctx context.Context, executable string, args []string) (*gatedProcess, error) {
+	// os.Pipe creates both descriptors close-on-exec under Go's fork lock. Keep
+	// the writer coordinator-exclusive; only the reader belongs in ExtraFiles.
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		return nil, err

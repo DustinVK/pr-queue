@@ -200,8 +200,15 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 	if err := stdout.Sync(); err != nil {
 		return result, err
 	}
-	logData, readErr := os.ReadFile(result.LogPath)
-	metadata.MarkFinished(ObservedIdentityFromJSONL(agent.Provider, logData))
+	var observed *ObservedIdentity
+	logReader, openErr := os.Open(result.LogPath)
+	var closeErr error
+	if openErr == nil {
+		observed = ObservedIdentityFromJSONLReader(agent.Provider, logReader)
+		closeErr = logReader.Close()
+	}
+	readErr := errors.Join(openErr, closeErr)
+	metadata.MarkFinished(observed)
 	metadataErr := WriteAgentMetadata(metadataPath, metadata)
 	if ctx.Err() != nil {
 		return result, errors.Join(ctx.Err(), readErr, metadataErr)

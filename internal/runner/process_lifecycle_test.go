@@ -56,7 +56,8 @@ func runLifecycleCoordinatorHelper() {
 	block := func() error {
 		mustWriteLifecycleFile(os.Getenv("PRQ_LIFECYCLE_GATE_PID"), strconv.Itoa(p.cmd.Process.Pid))
 		if phase == "before_identity" {
-			helper := exec.Command("/bin/sh", "-c", "sleep 60")
+			helper := exec.Command("/bin/sleep", "60")
+			helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 			if err := helper.Start(); err != nil {
 				panic(err)
 			}
@@ -152,13 +153,19 @@ func TestGatedProcessFaultBoundariesAndClosedAgentFD(t *testing.T) {
 			} else if !os.IsNotExist(startErr) {
 				t.Fatalf("agent executed before release: %v", startErr)
 			}
-			if phase == "before_release" && (o.AgentPID == 0 || o.AgentStart == "" || o.Released) {
-				t.Fatalf("identity was not persisted before release: %+v", o)
-			}
-			if phase == "before_release" {
-				stored := readLifecycleOwner(t, root)
-				if stored.Version != 2 || stored.AgentPID != o.AgentPID || stored.AgentStart == "" || stored.Released {
-					t.Fatalf("stored pre-release identity: %+v", stored)
+			saved := readLifecycleOwner(t, root)
+			switch phase {
+			case "before_identity":
+				if saved.Version != 2 || saved.AgentPID != 0 || saved.AgentStart != "" || saved.Released {
+					t.Fatalf("identity persisted before identity boundary: %+v", saved)
+				}
+			case "before_release":
+				if saved.Version != 2 || saved.AgentPID != o.AgentPID || saved.AgentStart == "" || saved.Released {
+					t.Fatalf("identity was not persisted before release: %+v", saved)
+				}
+			case "after_release":
+				if saved.Version != 2 || saved.AgentPID != o.AgentPID || saved.AgentStart == "" || !saved.Released {
+					t.Fatalf("release was not persisted after release: %+v", saved)
 				}
 			}
 		})
@@ -210,6 +217,7 @@ func TestGatedProcessRealSaveReleaseAndIdentityFailures(t *testing.T) {
 	t.Run("empty identity", func(t *testing.T) {
 		root, o := lifecycleRoot(t)
 		bin := t.TempDir()
+		originalPath := os.Getenv("PATH")
 		ps := filepath.Join(bin, "ps")
 		if err := os.WriteFile(ps, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
 			t.Fatal(err)
@@ -224,6 +232,7 @@ func TestGatedProcessRealSaveReleaseAndIdentityFailures(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "could not identify agent process") {
 			t.Fatalf("empty identity failure = %v", err)
 		}
+		t.Setenv("PATH", originalPath)
 		assertLifecycleProcessGone(t, p.cmd.Process.Pid)
 	})
 }
@@ -246,6 +255,13 @@ func TestCoordinatorDeathAcrossGatePhases(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
 			waitLifecycleFile(ready, 5*time.Second)
+			gatePID := readLifecyclePID(t, gatePIDPath)
+			registerLifecycleGroupCleanup(t, gatePID)
+			var helperPID int
+			if phase == "before_identity" {
+				helperPID = readLifecyclePID(t, unrelatedPIDPath)
+				registerLifecycleGroupCleanup(t, helperPID)
+			}
 			stored := readLifecycleOwner(t, root)
 			switch phase {
 			case "before_identity":
@@ -266,7 +282,6 @@ func TestCoordinatorDeathAcrossGatePhases(t *testing.T) {
 			}
 			_, _ = cmd.Process.Wait()
 
-			gatePID := readLifecyclePID(t, gatePIDPath)
 			if phase == "after_release" {
 				cleaned, err := (Runner{StateDir: state}).Cleanup(t.Context())
 				if err != nil || len(cleaned) != 1 {
@@ -292,15 +307,72 @@ func TestCoordinatorDeathAcrossGatePhases(t *testing.T) {
 				}
 			}
 			if phase == "before_identity" {
-				helperPID := readLifecyclePID(t, unrelatedPIDPath)
-				t.Cleanup(func() { _ = syscall.Kill(helperPID, syscall.SIGKILL) })
 				stamp, err := processStart(t.Context(), helperPID)
 				if err != nil || stamp == "" {
 					t.Fatalf("unrelated helper did not remain alive: %q %v", stamp, err)
 				}
-				_ = syscall.Kill(helperPID, syscall.SIGKILL)
 			}
 		})
+	}
+}
+
+func TestConcurrentGateAndUnrelatedProcessLaunchesDoNotShareWriter(t *testing.T) {
+	// os.Pipe descriptors are close-on-exec. Launching unrelated processes while
+	// gates are pending detects a regression that lets an exclusive writer escape.
+	for i := 0; i < 4; i++ {
+		started := filepath.Join(t.TempDir(), "agent-started")
+		p, err := lifecycleProcess(t.Context(), started, filepath.Join(t.TempDir(), "fd"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		helper := exec.Command("/bin/sleep", "60")
+		helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		gateResult := make(chan error, 1)
+		helperResult := make(chan error, 1)
+		begin := make(chan struct{})
+		go func() {
+			<-begin
+			gateResult <- p.cmd.Start()
+		}()
+		go func() {
+			<-begin
+			helperResult <- helper.Start()
+		}()
+		close(begin)
+		if err := <-gateResult; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-helperResult; err != nil {
+			_ = p.cmd.Process.Kill()
+			_, _ = p.cmd.Process.Wait()
+			t.Fatal(err)
+		}
+		registerLifecycleGroupCleanup(t, helper.Process.Pid)
+		if err := p.reader.Close(); err != nil {
+			t.Fatal(err)
+		}
+		p.reader = nil
+		if err := p.writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		p.writer = nil
+		done := make(chan error, 1)
+		go func() { done <- p.cmd.Wait() }()
+		select {
+		case err := <-done:
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 125 {
+				t.Fatalf("gate exit = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("unrelated process retained gate writer")
+		}
+		if stamp, err := processStart(t.Context(), helper.Process.Pid); err != nil || stamp == "" {
+			t.Fatalf("unrelated helper did not remain alive: %q %v", stamp, err)
+		}
+		if _, err := os.Stat(started); !os.IsNotExist(err) {
+			t.Fatalf("agent executed without release: %v", err)
+		}
 	}
 }
 
