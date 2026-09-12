@@ -68,20 +68,7 @@ func Load(path string) (Config, error) {
 }
 
 func Parse(data []byte) (Config, error) {
-	var document yaml.Node
-	if err := yaml.Unmarshal(data, &document); err != nil {
-		return Config{}, fmt.Errorf("decode config: %w", err)
-	}
-	agentFields := mappingFields(mappingValue(document.Content, "agent"))
-	c := Defaults()
-	if _, present := agentFields["provider"]; present {
-		c.Agent.Provider = ""
-	}
-	if _, present := agentFields["executable"]; present {
-		c.Agent.Executable = ""
-	} else if provider := scalarValue(agentFields["provider"]); provider != "" {
-		c.Agent.Executable = provider
-	}
+	var c Config
 	d := yaml.NewDecoder(bytes.NewReader(data))
 	d.KnownFields(true)
 	if err := d.Decode(&c); err != nil {
@@ -95,10 +82,35 @@ func Parse(data []byte) (Config, error) {
 	default:
 		return c, fmt.Errorf("decode config: %w", err)
 	}
-	if node, present := agentFields["provider"]; present && (node.Tag == "!!null" || strings.TrimSpace(node.Value) == "") {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return c, fmt.Errorf("decode config: %w", err)
+	}
+	root := documentNode(&document)
+	agentNode, _ := mappingField(root, "agent")
+	providerNode, providerPresent := mappingField(agentNode, "provider")
+	executableNode, executablePresent := mappingField(agentNode, "executable")
+	_, timeoutPresent := mappingField(agentNode, "timeout")
+	_, parallelPresent := mappingField(agentNode, "max_parallel_reviews")
+	if !providerPresent {
+		c.Agent.Provider = ProviderClaude
+	}
+	if !executablePresent {
+		c.Agent.Executable = c.Agent.Provider
+	}
+	if !timeoutPresent {
+		c.Agent.Timeout = 15 * time.Minute
+	}
+	if !parallelPresent {
+		c.Agent.MaxParallelReviews = 1
+	}
+	if c.Repos == nil {
+		c.Repos = []Repo{}
+	}
+	if providerPresent && nodeEmpty(providerNode) {
 		return c, fmt.Errorf("agent.provider must be claude or codex")
 	}
-	if node, present := agentFields["executable"]; present && (node.Tag == "!!null" || strings.TrimSpace(node.Value) == "") {
+	if executablePresent && nodeEmpty(executableNode) {
 		return c, fmt.Errorf("agent.executable must name an executable")
 	}
 	normalized, err := c.Agent.Normalized()
@@ -109,41 +121,51 @@ func Parse(data []byte) (Config, error) {
 	return c, c.Validate()
 }
 
-func mappingValue(nodes []*yaml.Node, key string) []*yaml.Node {
-	if len(nodes) == 0 {
-		return nil
-	}
-	n := nodes[0]
+func documentNode(n *yaml.Node) *yaml.Node {
 	if n.Kind == yaml.DocumentNode && len(n.Content) == 1 {
 		n = n.Content[0]
 	}
-	if n.Kind != yaml.MappingNode {
-		return nil
+	return resolveAlias(n)
+}
+
+func resolveAlias(n *yaml.Node) *yaml.Node {
+	for n != nil && n.Kind == yaml.AliasNode {
+		n = n.Alias
+	}
+	return n
+}
+
+func mappingField(n *yaml.Node, key string) (*yaml.Node, bool) {
+	n = resolveAlias(n)
+	if n == nil || n.Kind != yaml.MappingNode {
+		return nil, false
 	}
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		if n.Content[i].Value == key {
-			return []*yaml.Node{n.Content[i+1]}
+			return resolveAlias(n.Content[i+1]), true
 		}
 	}
-	return nil
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value != "<<" {
+			continue
+		}
+		merged := resolveAlias(n.Content[i+1])
+		if merged != nil && merged.Kind == yaml.SequenceNode {
+			for _, candidate := range merged.Content {
+				if value, ok := mappingField(candidate, key); ok {
+					return value, true
+				}
+			}
+		} else if value, ok := mappingField(merged, key); ok {
+			return value, true
+		}
+	}
+	return nil, false
 }
 
-func mappingFields(nodes []*yaml.Node) map[string]*yaml.Node {
-	fields := make(map[string]*yaml.Node)
-	if len(nodes) == 0 || nodes[0].Kind != yaml.MappingNode {
-		return fields
-	}
-	for i := 0; i+1 < len(nodes[0].Content); i += 2 {
-		fields[nodes[0].Content[i].Value] = nodes[0].Content[i+1]
-	}
-	return fields
-}
-
-func scalarValue(n *yaml.Node) string {
-	if n == nil || n.Kind != yaml.ScalarNode || n.Tag == "!!null" {
-		return ""
-	}
-	return n.Value
+func nodeEmpty(n *yaml.Node) bool {
+	n = resolveAlias(n)
+	return n == nil || n.Tag == "!!null" || (n.Kind == yaml.ScalarNode && strings.TrimSpace(n.Value) == "")
 }
 
 // Normalized applies compatibility defaults for callers that construct Agent directly.

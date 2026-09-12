@@ -91,10 +91,35 @@ func TestRejectExplicitEmptyProviderOrExecutable(t *testing.T) {
 	for _, field := range []string{
 		"provider: ''", "provider: null", "provider: ~",
 		"executable: ''", "executable: null", "executable: ~",
+		"provider: &empty null, executable: *empty",
 	} {
 		if _, err := Parse([]byte("github: {user: alice}\nagent: {" + field + "}")); err == nil {
 			t.Fatalf("accepted %s", field)
 		}
+	}
+}
+
+func TestProviderDefaultsThroughYAMLAliasesAndMerges(t *testing.T) {
+	for _, input := range []string{
+		"github: {user: alice}\nagent: {<<: &defaults {provider: codex}}",
+		"github: {user: &provider codex}\nagent: {provider: *provider}",
+	} {
+		c, err := Parse([]byte(input))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Agent.Provider != ProviderCodex || c.Agent.Executable != ProviderCodex {
+			t.Fatalf("agent: %+v", c.Agent)
+		}
+	}
+	if _, err := Parse([]byte("github: {user: alice}\nagent: {provider: &empty null, executable: *empty}")); err == nil {
+		t.Fatal("accepted alias to null provider")
+	}
+}
+
+func TestRejectRecursiveYAMLMerge(t *testing.T) {
+	if _, err := Parse([]byte("github: {user: alice}\nagent: &agent {<<: *agent}")); err == nil {
+		t.Fatal("accepted recursive YAML merge")
 	}
 }
 
