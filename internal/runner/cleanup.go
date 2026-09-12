@@ -10,22 +10,25 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/DustinVK/pr-queue/internal/localfs"
 	"github.com/google/uuid"
 )
 
 type owner struct {
+	Version    int    `json:"version,omitempty"`
 	ID         string `json:"id"`
 	PID        int    `json:"pid"`
 	Started    string `json:"started"`
 	AgentPID   int    `json:"agent_pid,omitempty"`
 	AgentStart string `json:"agent_start,omitempty"`
 	Starting   bool   `json:"starting_agent,omitempty"`
+	Released   bool   `json:"agent_released,omitempty"`
 }
 
 func newOwner(id string) (owner, error) {
-	o := owner{ID: id, PID: os.Getpid()}
+	o := owner{Version: 2, ID: id, PID: os.Getpid()}
 	var err error
 	o.Started, err = processStart(context.Background(), o.PID)
 	if err == nil && o.Started == "" {
@@ -122,7 +125,7 @@ func cleanupEntry(ctx context.Context, base, name string) (string, error) {
 	if err := json.Unmarshal(data, &o); err != nil {
 		return "", err
 	}
-	if o.ID != id || o.PID < 1 || o.Started == "" {
+	if o.ID != id || o.PID < 1 || o.Started == "" || (o.Version != 0 && o.Version != 2) {
 		return "", fmt.Errorf("invalid worktree ownership for %s", name)
 	}
 	stamp, err := processStart(ctx, o.PID)
@@ -132,7 +135,7 @@ func cleanupEntry(ctx context.Context, base, name string) (string, error) {
 	if stamp != "" && stamp == o.Started {
 		return "", nil
 	}
-	if o.Starting {
+	if o.Version == 0 && o.Starting {
 		// Cover a coordinator killed between Start and saving the child PID.
 		groups, err := sessionGroups(ctx, o.ID)
 		if err != nil {
@@ -143,7 +146,28 @@ func cleanupEntry(ctx context.Context, base, name string) (string, error) {
 				return "", err
 			}
 		}
-	} else if o.AgentPID > 1 {
+	} else if o.Version == 2 && o.AgentPID > 1 {
+		if o.AgentStart == "" {
+			return "", fmt.Errorf("invalid version 2 agent ownership for %s", name)
+		}
+		stamp, err := processStart(ctx, o.AgentPID)
+		if err != nil {
+			return "", err
+		}
+		if stamp != "" && stamp == o.AgentStart {
+			group, err := syscall.Getpgid(o.AgentPID)
+			if err != nil && !errors.Is(err, syscall.ESRCH) {
+				return "", err
+			}
+			if group == o.AgentPID {
+				if err := killGroup(o.AgentPID); err != nil {
+					return "", err
+				}
+			} else if err == nil {
+				return "", fmt.Errorf("version 2 agent process %d does not lead its process group", o.AgentPID)
+			}
+		}
+	} else if o.Version == 0 && o.AgentPID > 1 {
 		stamp, err := processStart(ctx, o.AgentPID)
 		if err != nil {
 			return "", err

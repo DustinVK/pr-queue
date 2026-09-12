@@ -117,6 +117,7 @@ func TestCleanupInterruptedBeforeAgentPIDSaved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	o.Version = 0 // Exercise an unversioned owner written by the legacy Claude runner.
 	o.Started = "previous coordinator with the same PID"
 	o.Starting = true
 	if err := saveOwner(root, o); err != nil {
