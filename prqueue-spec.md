@@ -232,6 +232,8 @@ An edit updates `findings.body` in place, resets `status` to `pending`, and clea
 
 Two nonblocking `flock` scopes: a global run lock and a per-PR lock keyed by `repo#number`. Observation updates, approve/reject/edit, ingestion, and the entire publish/resume operation take the per-PR lock. The agent executes outside it. Take the run lock before any PR lock and never hold multiple PR locks at once. A standalone command returns `3` on contention; within a run, observation contention is a non-failing skip (§3), while ingestion contention is a partial failure that leaves the cursor unchanged and allows other PRs to continue. Different PRs remain usable. Hold no SQLite transaction across agent execution or a GitHub request.
 
+Lock inspection queries the kernel without acquiring the lock. Holder metadata is a best-effort diagnostic: an incomplete record is reported as unavailable, and stale metadata alone never establishes ownership.
+
 `max_parallel_reviews` defaults to `1`; raise it deliberately when provider capacity and local resources permit.
 
 ## 10. Agent runner
