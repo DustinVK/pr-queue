@@ -61,7 +61,9 @@ func (s *Store) FailRun(ctx context.Context, r ReviewRun, status string, cause e
 
 type Ingestion struct {
 	Findings []Finding `json:"findings"`
-	Changed  int       `json:"changed"`
+	// Changed counts new or changed items in the replacement output,
+	// including its summary. Retired (obsolete) entries are excluded.
+	Changed int `json:"changed"`
 }
 
 // Ingest reads decisions inside the final transaction, never from the snapshot
