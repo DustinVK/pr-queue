@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -67,7 +68,8 @@ func runLifecycleCoordinatorHelper() {
 			waitLifecycleFile(os.Getenv("PRQ_LIFECYCLE_AGENT_STARTED"), 5*time.Second)
 		}
 		mustWriteLifecycleFile(os.Getenv("PRQ_LIFECYCLE_READY"), "ready")
-		select {}
+		time.Sleep(time.Minute)
+		panic("lifecycle block expired")
 	}
 	faults := &launchFaults{}
 	switch phase {
@@ -249,6 +251,8 @@ func TestCoordinatorDeathAcrossGatePhases(t *testing.T) {
 			gatePIDPath := filepath.Join(artifacts, "gate-pid")
 			unrelatedPIDPath := filepath.Join(artifacts, "unrelated-pid")
 			cmd := exec.Command(os.Args[0], "-test.run=^TestProcessLifecycleHelper$")
+			var coordinatorStderr bytes.Buffer
+			cmd.Stderr = &coordinatorStderr
 			cmd.Env = append(os.Environ(), lifecycleHelperEnv+"=coordinator", "PRQ_LIFECYCLE_PHASE="+phase, "PRQ_LIFECYCLE_ROOT="+root, "PRQ_LIFECYCLE_AGENT_STARTED="+started, "PRQ_LIFECYCLE_FD_CLOSED="+fdClosed, "PRQ_LIFECYCLE_READY="+ready, "PRQ_LIFECYCLE_GATE_PID="+gatePIDPath, "PRQ_LIFECYCLE_UNRELATED_PID="+unrelatedPIDPath)
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
@@ -256,6 +260,9 @@ func TestCoordinatorDeathAcrossGatePhases(t *testing.T) {
 			t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
 			waitLifecycleFile(ready, 5*time.Second)
 			gatePID := readLifecyclePID(t, gatePIDPath)
+			if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+				t.Fatalf("coordinator exited before injected death: %v: %s", err, &coordinatorStderr)
+			}
 			registerLifecycleGroupCleanup(t, gatePID)
 			var helperPID int
 			if phase == "before_identity" {
@@ -339,15 +346,19 @@ func TestConcurrentGateAndUnrelatedProcessLaunchesDoNotShareWriter(t *testing.T)
 			helperResult <- helper.Start()
 		}()
 		close(begin)
-		if err := <-gateResult; err != nil {
-			t.Fatal(err)
+		gateErr := <-gateResult
+		helperErr := <-helperResult
+		if helperErr == nil {
+			registerLifecycleGroupCleanup(t, helper.Process.Pid)
 		}
-		if err := <-helperResult; err != nil {
+		if gateErr != nil {
+			t.Fatal(gateErr)
+		}
+		if helperErr != nil {
 			_ = p.cmd.Process.Kill()
 			_, _ = p.cmd.Process.Wait()
-			t.Fatal(err)
+			t.Fatal(helperErr)
 		}
-		registerLifecycleGroupCleanup(t, helper.Process.Pid)
 		if err := p.reader.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -422,6 +433,34 @@ func assertLifecycleProcessGone(t *testing.T, pid int) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func registerLifecycleGroupCleanup(t *testing.T, pid int) string {
+	t.Helper()
+	stamp, err := processStart(t.Context(), pid)
+	if err != nil || stamp == "" {
+		t.Fatalf("identify process %d for cleanup: %q %v", pid, stamp, err)
+	}
+	registerLifecycleKnownGroupCleanup(t, pid, stamp)
+	return stamp
+}
+
+func registerLifecycleKnownGroupCleanup(t *testing.T, pid int, stamp string) {
+	t.Helper()
+	group, err := syscall.Getpgid(pid)
+	if err != nil || group != pid {
+		t.Fatalf("process %d is not its group leader: group=%d error=%v", pid, group, err)
+	}
+	t.Cleanup(func() {
+		current, err := processStart(context.Background(), pid)
+		if err != nil || current == "" || current != stamp {
+			return
+		}
+		group, err := syscall.Getpgid(pid)
+		if err == nil && group == pid {
+			_ = killGroup(pid)
+		}
+	})
 }
 
 func readLifecycleOwner(t *testing.T, root string) owner {
