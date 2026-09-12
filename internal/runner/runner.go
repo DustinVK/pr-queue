@@ -118,7 +118,7 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 	sort.Strings(paths)
 	for _, path := range paths {
 		f := req.Diff.Files[path]
-		fmt.Fprintf(&diff, "File: %s\n%s\n", path, f.Patch)
+		fmt.Fprintf(&diff, "File: %q\n%s\n", path, f.Patch)
 		if f.Error != "" {
 			fmt.Fprintf(&diff, "Anchor validation unavailable: %s\n", f.Error)
 		}

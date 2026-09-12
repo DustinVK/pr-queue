@@ -18,6 +18,7 @@ The supplied current PR diff is in: %q
 Write exactly one JSON document to this absolute file path: %q
 
 Read the supplied diff and relevant source. You may run focused tests/builds.
+Each File header quotes and escapes its filename; escaped characters belong to the path.
 Keep scratch experiment files in a subdirectory beside the supplied output file,
 not in fixed global temporary paths. This run's output directory is private.
 Report concrete, actionable problems introduced by this change. Do the review yourself.
