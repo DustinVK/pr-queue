@@ -248,6 +248,10 @@ The runner clears inherited repository-specific Git context (including directory
 
 Recovery attempts each independent ownership entry and reports all per-entry failures, so one invalid entry does not prevent cleanup of other orphans. Unresolved ownership or cleanup errors still refuse a new review pass.
 
+For a saved agent PID, recovery signals its process group only when the leader is still present and its start time matches the recorded agent. A missing or reused leader does not identify the remaining group: recovery removes the owned worktree but leaves any unidentified descendants alone. The interrupted-start window instead uses the run's session UUID to identify a group leader.
+
+Non-dry runs retain findings, prompts, and agent diagnostics under `~/.local/state/prqueue/runs/<run-id>/` after both success and failure. V1 does not prune these diagnostics automatically. Dry-run output is temporary and removed by the CLI.
+
 ## 11. Config
 
 `~/.config/prqueue/config.yaml`.

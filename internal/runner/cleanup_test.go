@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -13,6 +14,97 @@ import (
 
 	"github.com/google/uuid"
 )
+
+func TestCleanupLeavesUnidentifiedAgentGroupsAlone(t *testing.T) {
+	for _, leaderGone := range []bool{false, true} {
+		name := "reused PID with live leader"
+		if leaderGone {
+			name = "absent leader with surviving member"
+		}
+		t.Run(name, func(t *testing.T) {
+			r := Runner{StateDir: t.TempDir()}
+			childFile := filepath.Join(t.TempDir(), "child.pid")
+			cmd := exec.Command("/bin/sh", "-c", `sleep 30 >/dev/null 2>&1 & echo "$!" > "$1"; wait`, "fixture", childFile)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			var child int
+			var childStart string
+			t.Cleanup(func() {
+				if cmd.ProcessState == nil {
+					// The unreaped fixture leader still reserves this group ID.
+					killGroup(cmd.Process.Pid)
+					cmd.Wait()
+				} else if stamp, _ := processStart(context.Background(), child); stamp != "" && stamp == childStart {
+					syscall.Kill(child, syscall.SIGKILL)
+				}
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			for child == 0 {
+				data, err := os.ReadFile(childFile)
+				if err == nil {
+					child, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+				}
+				if child > 0 {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					t.Fatal("fixture child never started")
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
+			childStart, err := processStart(ctx, child)
+			if err != nil || childStart == "" {
+				t.Fatalf("fixture child not alive: %v", err)
+			}
+			group, err := syscall.Getpgid(child)
+			if err != nil || group != cmd.Process.Pid {
+				t.Fatalf("fixture group: %d %v", group, err)
+			}
+			if leaderGone {
+				if err := cmd.Process.Kill(); err != nil {
+					t.Fatal(err)
+				}
+				cmd.Wait()
+				if stamp, err := processStart(ctx, group); err != nil || stamp != "" {
+					t.Fatalf("fixture leader not gone: %q %v", stamp, err)
+				}
+			}
+			id := uuid.NewString()
+			root := filepath.Join(r.StateDir, "worktrees", id)
+			if err := os.MkdirAll(root, 0700); err != nil {
+				t.Fatal(err)
+			}
+			o, err := newOwner(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			o.Started = "previous coordinator"
+			o.AgentPID = group
+			o.AgentStart = "previous agent, not this fixture"
+			if err := saveOwner(root, o); err != nil {
+				t.Fatal(err)
+			}
+			cleaned, err := r.Cleanup(ctx)
+			if err != nil || len(cleaned) != 1 || cleaned[0] != id {
+				t.Fatalf("cleanup: %v %v", cleaned, err)
+			}
+			// Allow a wrongly delivered SIGKILL to become observable.
+			time.Sleep(50 * time.Millisecond)
+			if stamp, err := processStart(ctx, child); err != nil || stamp != childStart {
+				t.Fatalf("cleanup killed an unidentified member: %q %v", stamp, err)
+			}
+			for _, path := range []string{root, ownerPath(root)} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("owned artifact remains: %s %v", path, err)
+				}
+			}
+		})
+	}
+}
 
 func TestCleanupInterruptedBeforeAgentPIDSaved(t *testing.T) {
 	r := Runner{StateDir: t.TempDir()}

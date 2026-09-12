@@ -148,7 +148,9 @@ func cleanupEntry(ctx context.Context, base, name string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if stamp == "" || stamp == o.AgentStart {
+		// A group can outlive its leader, and stale metadata can survive a
+		// reboot or PID reuse. Absence is not evidence that the group is ours.
+		if stamp != "" && stamp == o.AgentStart {
 			if err := killGroup(o.AgentPID); err != nil {
 				return "", err
 			}
