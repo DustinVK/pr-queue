@@ -8,13 +8,13 @@ A CLI tool that drafts PR reviews with a coding agent, keeps every finding in a 
 
 `prq` polls configured repos, reviews eligible PRs with a coding agent in a fresh git worktree, and writes proposed findings to a local SQLite queue. The coordinator sends reviews only through `prq publish`: one submitted review containing findings you've explicitly approved, never a staged draft.
 
-**The publisher's guarantee:** it sends only the exact text and anchors approved against the comparison it verifies immediately before sending (§3). Editing a finding or observing a changed comparison clears approval. The request names the verified commit; a push during the request does not make that review cover newer code. The agent is trusted local code instructed not to publish. It runs with your full user permissions and can access ambient `gh` authentication, so this guarantee does not constrain a misbehaving agent process. Process isolation remains deferred in `FUTURE.md`.
+**The publisher's guarantee:** it sends only the exact text and anchors approved against the comparison it verifies immediately before sending (§3). Editing a finding or observing a changed comparison clears approval. The request names the verified commit; a push during the request does not make that review cover newer code. The selected agent is trusted local code instructed not to publish. Claude retains full user permissions; Codex uses its native command sandbox (§10). Neither a worktree nor this publisher guarantee constrains every possible agent action or removes ambient authentication. Whole-process isolation remains deferred in `FUTURE.md`.
 
 ## 2. MVP scope
 
-**In:** macOS, github.com, one configured account, one agent (Claude Code), manual `prq run`, full CLI triage, SQLite, optional desktop notification.
+**In:** macOS, github.com, one configured account, one selected agent (Claude Code or Codex CLI), manual `prq run`, full CLI triage, SQLite, optional desktop notification.
 
-**Explicitly not in v1** (see `FUTURE.md` for why each is deferred, not forgotten): a scheduler/daemon, a web UI, Docker/sandboxed execution, cross-machine notification, an auto-publish policy, staged/pending GitHub reviews, multi-agent support.
+**Explicitly not in v1** (see `FUTURE.md` for why each is deferred, not forgotten): a scheduler/daemon, a web UI, Docker/whole-process isolation, cross-machine notification, an auto-publish policy, staged/pending GitHub reviews, simultaneous multi-provider review, or provider fallback.
 
 **Host requirements:** `git`, authenticated `gh`, the agent's own executable and model auth in the environment. No server to deploy.
 
@@ -28,7 +28,7 @@ A CLI tool that drafts PR reviews with a coding agent, keeps every finding in a 
 4. Capture the selected key in `review_runs.comparison_key`, prepare a fresh worktree at its head, run the agent, and validate `findings.json` (§5). Before ingestion, take that PR's lock and refresh its state again. If the comparison changed, retain the output for diagnostics, mark the attempt `failed`, and leave the new comparison eligible; do not activate stale findings. Otherwise write findings, advance `last_reviewed_key` to the captured key, and append audit entries in one transaction, using the latest local decisions. The agent executes outside the lock. A failed or timed-out run never advances the cursor.
 5. Fire one desktop notification if anything needs a look (§6). Exit `0` (ok), `1` (fatal — bad config, no auth), or `2` (some repos/PRs failed, others didn't).
 
-`--pr N` requires `--repo` and forces a fresh review even when the key matches, bypassing the configured filters and draft exclusion. It never permits reviewing a closed/merged PR. `approve` and `publish` still refuse a currently draft PR regardless of how it was reviewed. `--dry-run` runs the agent (real cost) with temporary worktree/output files; the coordinator computes observations and resulting queue changes in memory, persists no database changes (including observed head/base/draft/state, run records, cursor, and audit), makes no GitHub writes, and sends no notification. The agent's unisolated host access remains as stated in §10.
+`--pr N` requires `--repo` and is itself the force mechanism: it bypasses the successful cursor, configured filters, and draft exclusion. It never bypasses PR lock contention or permits reviewing a closed/merged PR. Provider/model selection is absent from comparison identity: changing providers does not invalidate cursors, approvals, or historical runs. Keep `--pr N` on retries of a forced review when an older successful cursor exists. An exit code of 0 alone does not prove an agent ran; require a new succeeded review-run ID, matching comparison/output, and provider execution evidence. `approve` and `publish` still refuse a currently draft PR regardless of how it was reviewed. `--dry-run` runs the selected agent (real cost) with temporary worktree/output files; the coordinator computes observations and resulting queue changes in memory, persists no database changes (including observed head/base/draft/state, run records, cursor, and audit), makes no GitHub writes, and sends no notification. The agent's permissions remain as stated in §10.
 
 No scheduler is built in — `prq run` is invoked by hand, or later by launchd/systemd (`FUTURE.md`), unchanged either way.
 
@@ -64,7 +64,7 @@ Approval verifies the authenticated identity, current comparison, and anchor, th
 
 ## 5. The findings contract
 
-The agent writes one JSON file to a path `prq` supplies — never stdout, never prose you regex.
+The runner consumes one JSON file at a path `prq` supplies. Claude writes the file as instructed in its prompt; Codex CLI writes its schema-constrained final response there using `--output-last-message`. Agent stdout/JSONL is diagnostic material and is never parsed into findings or repaired into a valid document.
 
 ```json
 {
@@ -242,9 +242,11 @@ Lock inspection queries the kernel without acquiring the lock. Holder metadata i
 
 ## 10. Agent runner
 
-Every review runs in a fresh, detached git worktree — never the checkout you're actively using. It may read, run tests, and build; it is instructed not to commit, push, or invoke `gh`. **This is an instruction, not an enforced boundary.** V1's default mode runs the agent with your full user permissions, and withholding `prqueue`'s own GitHub credentials from its environment does not stop it from using `gh`'s ambient auth (keychain, or `~/.config/gh/hosts.yml`) if it decided to call `gh pr review` itself. The guarantee in §1 holds because `prqueue`'s publisher is separate code that only ever sends content you approved — it says nothing about what the agent process itself could do if it misbehaved.
+Every review runs in a fresh, detached git worktree. The selected agent may inspect source and perform focused checks; the prompt instructs it not to edit source, commit, push, invoke `gh`, or contact external review services. A worktree and prompt instructions are not an enforcement boundary for trusted local code. Removing GitHub token variables does not remove ambient `gh` authentication. The guarantee in §1 belongs to the publisher.
 
-This is the same trust boundary you already accept running `claude -p` directly against your own repos day to day — v1 doesn't claim to improve on it, and `prq init` says so plainly once, requiring an explicit yes before the first run. Closing this gap for real means process isolation — Docker mode, deferred in `FUTURE.md`.
+Claude keeps `--dangerously-skip-permissions` and full user permissions. Codex uses unattended `exec` with `--ask-for-approval never`, `workspace-write`, command network access disabled, inherited extra writable roots cleared, and the run's scratch directory granted alongside the checkout and standard temporary roots. Model-network access, loaded instructions/configuration, and other configured tools remain part of the trusted CLI. Unavailable dependency downloads or checks requiring broader access are reported, with no automatic escalation or provider fallback. The asymmetry is intentional for this release; tightening Claude requires separate design and validation.
+
+`prq init` requires explicit trusted-agent acknowledgment. Existing `agent-consent-v1` remains valid when the selected provider changes; configuration and consent are preserved on reruns. No database migration or provider-dependent comparison identity is introduced.
 
 Default timeout 15 minutes, worktree removed on completion including failure. An orphaned worktree from an interrupted run is cleaned up on the next invocation once its owning process is confirmed dead.
 
@@ -252,9 +254,11 @@ The runner clears inherited repository-specific Git context (including directory
 
 Recovery attempts each independent ownership entry and reports all per-entry failures, so one invalid entry does not prevent cleanup of other orphans. Unresolved ownership or cleanup errors still refuse a new review pass.
 
-For a saved agent PID, recovery signals its process group only when the leader is still present and its start time matches the recorded agent. A missing or reused leader does not identify the remaining group: recovery removes the owned worktree but leaves any unidentified descendants alone. The interrupted-start window instead uses the run's session UUID to identify a group leader.
+Both providers start behind a fixed shell gate. An exec-safe control pipe keeps its close-on-exec write end exclusively in the coordinator. Only the shell receives the read end, and closes it before executing the agent. The coordinator saves nonempty child PID/start/group identity before releasing the gate; coordinator death before release produces EOF without agent execution. Version-2 owner files record this lifecycle. Legacy unversioned Claude owners retain session-ID interrupted-start discovery, independent of the currently selected provider.
 
-Non-dry runs retain findings, prompts, and agent diagnostics under `~/.local/state/prqueue/runs/<run-id>/` after both success and failure. V1 does not prune these diagnostics automatically. Dry-run output is temporary and removed by the CLI.
+For a saved agent PID, recovery signals its process group only when the leader is still present and its start time matches the recorded agent. A missing or reused leader does not identify the remaining group: recovery removes the owned worktree but leaves unidentified descendants alone. Unknown owner versions or cleanup errors retain evidence and fail the new pass while other independent entries are still attempted. Hard coordinator death during Git helper execution remains a limitation; normal Git cancellation still terminates its owned group.
+
+Non-dry runs retain findings, prompts, schema where applicable, and separate JSONL/stderr diagnostics under `~/.local/state/prqueue/runs/<run-id>/` after both success and failure. Private `agent-metadata.json` records the provider, configured/resolved executable, supplied options, lifecycle evidence, and observed identity when reported. Model selection is inherited; unknown observed identity stays unknown. Prepared metadata is not proof of execution, and missing historical metadata is not proof of a provider. Files use `0600`, directories `0700`. Diagnostics are not pruned automatically. Dry-run output is temporary and removed by the CLI.
 
 ## 11. Config
 
@@ -264,6 +268,7 @@ Non-dry runs retain findings, prompts, and agent diagnostics under `~/.local/sta
 github:
   user: your-login
 agent:
+  provider: claude
   executable: claude
   timeout: 15m
   max_parallel_reviews: 1
@@ -275,7 +280,9 @@ repos:
       base_branches: []
 ```
 
-Model auth (e.g. `ANTHROPIC_API_KEY`) comes from the invoking shell's environment — `prq` doesn't manage secrets. Keep committed examples generic: no employer-specific repo names, internal hosts, prompts, or source samples. Actual config lives outside the repo at the path above.
+`agent.provider` accepts `claude` or `codex`; omission preserves Claude behavior. An omitted executable defaults to the selected provider. An explicit executable, including a wrapper path, is preserved and must accept that provider's CLI arguments. Change or remove an existing `executable: claude` when selecting Codex. Explicit empty/null provider or executable values, unsupported providers, and unknown fields are rejected. Timeout and concurrency retain existing values; defaults for new config remain 15m and 1.
+
+Model selection and authentication come from the selected CLI's configuration, supported saved login, or environment; prq supplies no model/profile override and manages no secrets. Only Git, gh, and the selected agent executable are required. Keep committed examples generic: no employer-specific repo names, internal hosts, prompts, or source samples. Actual config lives outside the repo at the path above.
 
 ## 12. Package layout
 
@@ -311,4 +318,4 @@ The short list that actually protects the guarantee in §1 — not a release gat
 
 - GitHub transport: shell out to `gh` in v1 and verify the configured identity; changing the transport later stays within `internal/github`.
 - Triggers: poll current state, record observed transitions before filtering, and include drafts becoming ready as specified in §3. No webhook-event reconstruction or generation counter.
-- Agent: Claude Code in v1. Measure quality on deliberately selected real PRs before considering a local-model or escalation path; that work remains in `FUTURE.md`.
+- Agent: explicit Claude Code or Codex CLI selection through the shared runner. Local-model escalation, simultaneous multi-provider reviews, and automatic fallback remain in `FUTURE.md`.

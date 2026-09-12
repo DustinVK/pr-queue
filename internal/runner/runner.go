@@ -48,7 +48,7 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 	if err != nil {
 		return result, err
 	}
-	resolvedExecutable, err := exec.LookPath(agent.Executable)
+	resolvedExecutable, err := resolveExecutable(agent.Executable)
 	if err != nil {
 		return result, fmt.Errorf("find agent executable %q: %w", agent.Executable, err)
 	}
@@ -200,8 +200,15 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 	if err := stdout.Sync(); err != nil {
 		return result, err
 	}
-	logData, readErr := os.ReadFile(result.LogPath)
-	metadata.MarkFinished(ObservedIdentityFromJSONL(agent.Provider, logData))
+	var observed *ObservedIdentity
+	logReader, openErr := os.Open(result.LogPath)
+	var closeErr error
+	if openErr == nil {
+		observed = ObservedIdentityFromJSONLReader(agent.Provider, logReader)
+		closeErr = logReader.Close()
+	}
+	readErr := errors.Join(openErr, closeErr)
+	metadata.MarkFinished(observed)
 	metadataErr := WriteAgentMetadata(metadataPath, metadata)
 	if ctx.Err() != nil {
 		return result, errors.Join(ctx.Err(), readErr, metadataErr)
@@ -235,6 +242,14 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 	}
 	result.Document, err = DecodeProviderOutput(result.OutputPath, req.Input)
 	return result, err
+}
+
+func resolveExecutable(configured string) (string, error) {
+	resolved, err := exec.LookPath(configured)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Abs(resolved)
 }
 
 func agentEnv(output string, input findings.Input) []string {

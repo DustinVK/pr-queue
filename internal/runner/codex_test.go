@@ -3,7 +3,9 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -37,7 +39,7 @@ printf '%s\n' 'separate stderr' >&2
 case "${PRQ_CODEX_MODE:-success}" in
   missing) exit 0 ;;
   invalid) printf '%s' 'not JSON' > "$output"; exit 0 ;;
-  nonzero) printf '%s' '{"plausible":"but failed"}' > "$output"; exit 23 ;;
+  nonzero) printf '%s' "${PRQ_CODEX_DOCUMENT:?}" > "$output"; exit 23 ;;
 esac
 printf '%s' "${PRQ_CODEX_DOCUMENT:?}" > "$output"
 `
@@ -45,6 +47,72 @@ printf '%s' "${PRQ_CODEX_DOCUMENT:?}" > "$output"
 		t.Fatal(err)
 	}
 	return path
+}
+
+// This is an explicit opt-in paid integration check, never an ordinary test.
+func TestManualCodexSmoke(t *testing.T) {
+	if os.Getenv("PRQ_CODEX_REAL_SMOKE") != "1" {
+		t.Skip("set PRQ_CODEX_REAL_SMOKE=1 and PRQ_CODEX_SMOKE_STATE to run the paid local Codex smoke check")
+	}
+	state := os.Getenv("PRQ_CODEX_SMOKE_STATE")
+	if !filepath.IsAbs(state) {
+		t.Fatal("PRQ_CODEX_SMOKE_STATE must be an absolute private diagnostics directory")
+	}
+	executable := os.Getenv("PRQ_CODEX_SMOKE_EXECUTABLE")
+	if executable == "" {
+		executable = config.ProviderCodex
+	}
+	req, source := localFixture(t)
+	r := Runner{StateDir: state, Agent: config.Agent{Provider: config.ProviderCodex, Executable: executable, Timeout: 2 * time.Minute, MaxParallelReviews: 1}}
+	started := time.Now()
+	result, err := r.Review(t.Context(), req)
+	t.Logf("duration=%s output=%s log=%s metadata=%s", time.Since(started), result.OutputPath, result.LogPath, filepath.Join(filepath.Dir(result.OutputPath), MetadataFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TimedOut {
+		t.Fatal("real Codex agent timed out")
+	}
+	metadataData, err := os.ReadFile(filepath.Join(filepath.Dir(result.OutputPath), MetadataFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata AgentMetadata
+	if err := json.Unmarshal(metadataData, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Provider != config.ProviderCodex || metadata.State != "process_finished" || metadata.Observed == nil || metadata.Observed.Session == "" {
+		t.Fatalf("Codex execution provenance incomplete: %#v", metadata)
+	}
+	if metadata.ConfiguredExecutable != executable || metadata.ResolvedExecutable == "" {
+		t.Fatalf("Codex executable provenance incomplete: %#v", metadata)
+	}
+	if result.OutputPath != OutputPath(state, req.ID) {
+		t.Fatalf("output path = %q, want %q", result.OutputPath, OutputPath(state, req.ID))
+	}
+	diagnostics := filepath.Dir(result.OutputPath)
+	if err := filepath.Walk(diagnostics, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		want := os.FileMode(0600)
+		if info.IsDir() {
+			want = 0700
+		}
+		if info.Mode().Perm() != want {
+			return fmt.Errorf("private artifact mode %s = %o, want %o", path, info.Mode().Perm(), want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(state, "worktrees", req.ID)); !os.IsNotExist(err) {
+		t.Fatalf("worktree remained after smoke: %v", err)
+	}
+	head, err := exec.Command("git", "-C", source, "rev-parse", "HEAD").Output()
+	if err != nil || strings.TrimSpace(string(head)) != req.Input.HeadSHA {
+		t.Fatal("fixture source changed")
+	}
 }
 
 func codexRunner(t *testing.T, req Request, mode string) Runner {

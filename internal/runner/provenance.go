@@ -13,6 +13,7 @@ import (
 )
 
 const MetadataFilename = "agent-metadata.json"
+const maxObservedIdentityBytes = 8 * 1024 * 1024
 
 type ObservedIdentity struct {
 	CLI     string `json:"cli,omitempty"`
@@ -57,7 +58,11 @@ func (m *AgentMetadata) MarkFinished(observed *ObservedIdentity) {
 // ObservedIdentityFromJSONL extracts only provider event fields whose meaning
 // is explicit. Diagnostics that do not contain such an event prove nothing.
 func ObservedIdentityFromJSONL(provider string, data []byte) *ObservedIdentity {
-	decoder := json.NewDecoder(bytes.NewReader(data))
+	return ObservedIdentityFromJSONLReader(provider, bytes.NewReader(data))
+}
+
+func ObservedIdentityFromJSONLReader(provider string, r io.Reader) *ObservedIdentity {
+	decoder := json.NewDecoder(io.LimitReader(r, maxObservedIdentityBytes))
 	for {
 		var event struct {
 			Type      string `json:"type"`
