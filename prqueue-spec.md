@@ -244,6 +244,8 @@ This is the same trust boundary you already accept running `claude -p` directly 
 
 Default timeout 15 minutes, worktree removed on completion including failure. An orphaned worktree from an interrupted run is cleaned up on the next invocation once its owning process is confirmed dead.
 
+The runner clears inherited repository-specific Git context (including directory, index, object, and command-scoped configuration overrides) for its Git commands and the agent. Git therefore discovers the disposable checkout even when `prq` is invoked from a hook or another repository context. Normal global Git configuration, transport settings, and model authentication remain available; this is checkout isolation, not a permissions boundary.
+
 Recovery attempts each independent ownership entry and reports all per-entry failures, so one invalid entry does not prevent cleanup of other orphans. Unresolved ownership or cleanup errors still refuse a new review pass.
 
 ## 11. Config

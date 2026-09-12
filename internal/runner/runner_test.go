@@ -39,6 +39,13 @@ func TestMain(m *testing.M) {
 
 func fakeAgent(mode string) int {
 	output := os.Getenv("PRQUEUE_OUTPUT")
+	if mode == "starting-child" {
+		if err := os.WriteFile(output, []byte("ready"), 0600); err != nil {
+			panic(err)
+		}
+		time.Sleep(time.Minute)
+		return 0
+	}
 	if mode == "sleep-child" {
 		time.Sleep(time.Minute)
 		return 0
@@ -83,6 +90,22 @@ func fakeAgent(mode string) int {
 		if out, err := exec.Command("git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "unexpected").CombinedOutput(); err != nil {
 			fmt.Fprintln(os.Stderr, string(out))
 			return 46
+		}
+	}
+	if mode == "git-context" {
+		for _, check := range []struct {
+			args []string
+			want string
+		}{
+			{[]string{"rev-parse", "HEAD"}, input.HeadSHA},
+			{[]string{"status", "--porcelain=v1"}, ""},
+			{[]string{"config", "--get", "prqueue.testglobal"}, "preserved"},
+		} {
+			out, err := exec.Command("git", check.args...).CombinedOutput()
+			if err != nil || strings.TrimSpace(string(out)) != check.want {
+				fmt.Fprintf(os.Stderr, "agent git %v: %q %v; want %q\n", check.args, out, err, check.want)
+				return 47
+			}
 		}
 	}
 	d := findings.Document{SchemaVersion: 1, Repo: input.Repo, PR: input.PR, HeadSHA: input.HeadSHA, Summary: "Synthetic review", Verdict: "comment", Findings: []findings.Finding{}}
