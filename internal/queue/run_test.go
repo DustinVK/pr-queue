@@ -33,6 +33,41 @@ func runCoordinator(t *testing.T) (Coordinator, *fakeRemote) {
 }
 func repos() []config.Repo { return []config.Repo{{Name: "owner/repo"}} }
 
+type repositoryFailureRemote struct{ *fakeRemote }
+
+func (f repositoryFailureRemote) ListOpen(ctx context.Context, repo string) ([]github.PR, error) {
+	if repo == "owner/unavailable" {
+		return nil, errors.New("repository unavailable")
+	}
+	return f.fakeRemote.ListOpen(ctx, repo)
+}
+
+func TestCoordinatorRepositoryFailureDoesNotBlockHealthyRepository(t *testing.T) {
+	c, remote := runCoordinator(t)
+	c.Remote = repositoryFailureRemote{remote}
+	var reviewed []string
+	c.Reviewer = reviewFunc(func(_ context.Context, req runner.Request) (runner.Result, error) {
+		reviewed = append(reviewed, req.Input.Repo)
+		return fakeReview(req), nil
+	})
+	result, err := c.Run(t.Context(), []config.Repo{{Name: "owner/unavailable"}, {Name: "owner/repo"}}, 0)
+	var partial *PartialFailure
+	if !errors.As(err, &partial) || partial.Count != 1 || result.Failed != 1 || len(result.Repos) != 2 {
+		t.Fatalf("repository failure result: %+v %v", result, err)
+	}
+	bad, good := result.Repos[0], result.Repos[1]
+	if bad.Repo != "owner/unavailable" || len(bad.Problems) != 1 || bad.Problems[0].Repo != bad.Repo || bad.Problems[0].PR != 0 || len(bad.Reviews) != 0 {
+		t.Fatalf("wrong failure attribution: %+v", bad)
+	}
+	if len(reviewed) != 1 || reviewed[0] != "owner/repo" || len(good.Problems) != 0 || len(good.Reviews) != 1 || good.Reviews[0].Status != "succeeded" {
+		t.Fatalf("healthy repository did not complete: %+v; invoked %v", good, reviewed)
+	}
+	p, err := c.Store.PR(t.Context(), "owner/repo", 1)
+	if err != nil || p.LastReviewedKey == nil || *p.LastReviewedKey != p.Key() {
+		t.Fatalf("healthy review was not persisted: %+v %v", p, err)
+	}
+}
+
 func TestCoordinatorSuccessfulRerunSkipsAndForceReviews(t *testing.T) {
 	c, _ := runCoordinator(t)
 	calls := 0
