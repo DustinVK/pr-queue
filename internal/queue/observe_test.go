@@ -164,6 +164,36 @@ func TestMissingPRFetchedDirectlyNeverAssumedClosed(t *testing.T) {
 	}
 }
 
+func TestHeadAndBaseChangesClearApprovalAndCursor(t *testing.T) {
+	for _, field := range []string{"head", "base"} {
+		t.Run(field, func(t *testing.T) {
+			s, state := queueStore(t)
+			p := remotePR(1)
+			seedApproved(t, s, p)
+			changed := p
+			if field == "head" {
+				changed.HeadSHA = strings.Repeat("c", 40)
+			} else {
+				changed.BaseSHA = strings.Repeat("c", 40)
+			}
+			remote := &fakeRemote{open: []github.PR{changed}}
+			batch, err := (Observer{Store: s, Remote: remote, StateDir: state}).ObserveRepo(t.Context(), config.Repo{Name: p.Repo}, 0)
+			if err != nil || len(batch.Problems) != 0 || len(batch.Observations) != 1 {
+				t.Fatalf("observe: %+v %v", batch, err)
+			}
+			o := batch.Observations[0]
+			if !o.Changed || !o.Eligible || o.Local.Key() != changed.Key() {
+				t.Fatalf("changed comparison not eligible: %+v", o)
+			}
+			assertApproved(t, s, p, false)
+			var n int
+			if err := s.DB.QueryRow("SELECT count(*) FROM audit_log WHERE action='approval_cleared' AND body_snapshot='approved body'").Scan(&n); err != nil || n != 1 {
+				t.Fatalf("invalidation audit %d %v", n, err)
+			}
+		})
+	}
+}
+
 func TestIncompleteListDoesNotMutateObservations(t *testing.T) {
 	s, state := queueStore(t)
 	p := remotePR(1)

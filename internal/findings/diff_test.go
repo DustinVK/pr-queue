@@ -161,6 +161,40 @@ func TestTruncatedLaterHunkBlocksEarlierAnchor(t *testing.T) {
 	}
 }
 
+func TestParseGitDiffPathDelimiters(t *testing.T) {
+	// Fixtures preserve Git's raw tab delimiter after unquoted text headers.
+	for _, tc := range []struct {
+		name, headers, path string
+		text                bool
+	}{
+		{"spaces", "diff --git a/with space.go b/with space.go\n--- a/with space.go\t\n+++ b/with space.go\t\n", "with space.go", true},
+		{"trailing space", "diff --git a/trailing  b/trailing \n--- a/trailing \t\n+++ b/trailing \t\n", "trailing ", true},
+		{"quoted tab", "diff --git \"a/with\\ttab.go\" \"b/with\\ttab.go\"\n--- \"a/with\\ttab.go\"\n+++ \"b/with\\ttab.go\"\n", "with\ttab.go", true},
+		{"binary", "diff --git a/dir b/file.bin b/dir b/file.bin\nBinary files a/dir b/file.bin and b/dir b/file.bin differ\n", "dir b/file.bin", false},
+		{"mode only", "diff --git a/plain b/nope.txt b/plain b/nope.txt\nold mode 100644\nnew mode 100755\n", "plain b/nope.txt", false},
+		{"rename", "diff --git a/old b/name b/new b/name\nsimilarity index 100%\nrename from old b/name\nrename to new b/name\n", "new b/name", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			patch := tc.headers
+			if tc.text {
+				patch += "@@ -1 +1 @@\n-old\n+new\n"
+			}
+			d, err := ParseDiff(patch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(d.Files) != 1 || d.Files[tc.path] == nil {
+				t.Fatalf("incorrect path: %v", d.Files)
+			}
+			f := sampleDocument().Findings[0]
+			f.Path, f.Line = Ptr(tc.path), Ptr(1)
+			if err := d.Validate(f); (err == nil) != tc.text {
+				t.Fatalf("text=%t: %v", tc.text, err)
+			}
+		})
+	}
+}
+
 func TestOverlappingHunksCannotValidateAmbiguousLines(t *testing.T) {
 	d := Diff{}
 	d.AddPatch("file.go", patchFixture+"@@ -1 +1 @@\n-a\n+b\n")
