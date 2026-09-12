@@ -83,7 +83,6 @@ func ObservedIdentityFromJSONLReader(provider string, r io.Reader) *ObservedIden
 			return &ObservedIdentity{Model: event.Model, Session: event.SessionID}
 		}
 	}
-	return nil
 }
 
 func WriteAgentMetadata(path string, metadata AgentMetadata) error {
