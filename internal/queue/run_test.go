@@ -33,6 +33,62 @@ func runCoordinator(t *testing.T) (Coordinator, *fakeRemote) {
 }
 func repos() []config.Repo { return []config.Repo{{Name: "owner/repo"}} }
 
+func TestCoordinatorPreservesDiffPathsAndChangeCounts(t *testing.T) {
+	c, remote := runCoordinator(t)
+	remote.diff.AddPatch("value.txt", "@@ -1 +1 @@\n-old\n+new\n")
+	valid := findings.Finding{Kind: "inline", Severity: "minor", Category: "correctness", Title: "Valid", Body: "Valid body", Anchor: findings.Anchor{Path: findings.Ptr("value.txt"), Side: findings.Ptr("RIGHT"), Line: findings.Ptr(1)}}
+	invalid := valid
+	invalid.Title, invalid.Body, invalid.Line = "Invalid", "Invalid body", findings.Ptr(3)
+	items := []findings.Finding{valid, invalid}
+	c.Reviewer = reviewFunc(func(_ context.Context, req runner.Request) (runner.Result, error) {
+		if err := req.Diff.Validate(valid); err != nil {
+			t.Errorf("reviewer did not receive the fetched diff: %v", err)
+		}
+		if err := req.Diff.Validate(invalid); err == nil {
+			t.Error("reviewer diff accepted a line outside the patch")
+		}
+		result := fakeReview(req)
+		result.Document.Findings = items
+		return result, nil
+	})
+	first, err := c.Run(t.Context(), repos(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := first.Repos[0].Reviews[0]
+	if first.Changed != 3 || review.Ingestion == nil || review.Ingestion.Changed != 3 || len(review.Ingestion.Findings) != 3 {
+		t.Fatalf("summary and two new findings not counted: %+v", first)
+	}
+	for i, want := range []string{"pending", "pending", "blocked"} {
+		f := review.Ingestion.Findings[i]
+		stored, err := c.Store.ResolveFinding(t.Context(), f.ID)
+		if err != nil || f.Status != want || stored.Status != want {
+			t.Fatalf("finding %d status: %+v %+v %v, want %s", i, f, stored, err, want)
+		}
+	}
+	wantPath := runner.OutputPath(c.WorkDir, review.ID)
+	var storedPath string
+	if err := c.Store.DB.QueryRowContext(t.Context(), "SELECT raw_output_path FROM review_runs WHERE id=?", review.ID).Scan(&storedPath); err != nil || storedPath != wantPath || review.OutputPath != wantPath {
+		t.Fatalf("recorded diagnostic destination: returned %q stored %q, want %q: %v", review.OutputPath, storedPath, wantPath, err)
+	}
+	// Drop the pending inline item while keeping the summary and blocked item
+	// byte-identical. Only retirement occurs, so no new/changed item is counted.
+	dropped := review.Ingestion.Findings[1].ID
+	items = []findings.Finding{invalid}
+	second, err := c.Run(t.Context(), repos(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingested := second.Repos[0].Reviews[0].Ingestion
+	if second.Changed != 0 || ingested == nil || ingested.Changed != 0 {
+		t.Fatalf("retirement counted as new or changed output: %+v", second)
+	}
+	retired, err := c.Store.ResolveFinding(t.Context(), dropped)
+	if err != nil || retired.Status != "obsolete" {
+		t.Fatalf("omitted finding was not retired: %+v %v", retired, err)
+	}
+}
+
 type repositoryFailureRemote struct{ *fakeRemote }
 
 func (f repositoryFailureRemote) ListOpen(ctx context.Context, repo string) ([]github.PR, error) {
