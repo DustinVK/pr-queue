@@ -39,6 +39,13 @@ func TestMain(m *testing.M) {
 
 func fakeAgent(mode string) int {
 	output := os.Getenv("PRQUEUE_OUTPUT")
+	if mode == "starting-child" {
+		if err := os.WriteFile(output, []byte("ready"), 0600); err != nil {
+			panic(err)
+		}
+		time.Sleep(time.Minute)
+		return 0
+	}
 	if mode == "sleep-child" {
 		time.Sleep(time.Minute)
 		return 0
