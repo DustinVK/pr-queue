@@ -68,8 +68,12 @@ func Parse(data []byte) (Config, error) {
 		return c, fmt.Errorf("decode config: %w", err)
 	}
 	var extra any
-	if err := d.Decode(&extra); err != io.EOF {
+	switch err := d.Decode(&extra); {
+	case err == io.EOF:
+	case err == nil:
 		return c, fmt.Errorf("config must contain exactly one YAML document")
+	default:
+		return c, fmt.Errorf("decode config: %w", err)
 	}
 	return c, c.Validate()
 }
