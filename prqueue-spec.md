@@ -276,6 +276,8 @@ internal/store/     sqlite, migrations
 internal/runner/    worktree lifecycle, agent exec, timeout
 internal/queue/     approve/reject/edit/list/show — the seam a future UI would call
 internal/notify/    Sink interface; desktop (macOS) ships in v1
+internal/lock/      the two nonblocking flock scopes
+internal/localfs/   private directories and atomic file installation/replacement
 ```
 
 ## 13. Acceptance scenarios
