@@ -90,8 +90,20 @@ func TestCoordinatorFailuresStayRetryable(t *testing.T) {
 		})
 		result, err := c.Run(t.Context(), repos(), 0)
 		var partial *PartialFailure
-		if !errors.As(err, &partial) || result.Failed != 1 {
+		if !errors.As(err, &partial) || partial.Count != 1 || result.Failed != 1 || len(result.Repos) != 1 || len(result.Repos[0].Reviews) != 1 {
 			t.Fatalf("failure: %+v %v", result, err)
+		}
+		want := "failed"
+		if timeout {
+			want = "timed_out"
+		}
+		review := result.Repos[0].Reviews[0]
+		if review.Status != want {
+			t.Fatalf("review status %q, want %q", review.Status, want)
+		}
+		var status string
+		if err := c.Store.DB.QueryRowContext(t.Context(), "SELECT status FROM review_runs WHERE id=?", review.ID).Scan(&status); err != nil || status != want {
+			t.Fatalf("persisted run status %q, want %q: %v", status, want, err)
 		}
 		p, err := c.Store.PR(t.Context(), "owner/repo", 1)
 		if err != nil || p.LastReviewedKey != nil {

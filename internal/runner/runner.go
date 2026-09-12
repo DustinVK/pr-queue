@@ -77,9 +77,7 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 		return result, err
 	}
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		if e := removeWorktree(cleanupCtx, root); e != nil {
+		if e := removeWorktree(root); e != nil {
 			err = errors.Join(err, e)
 		}
 	}()

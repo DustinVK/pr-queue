@@ -110,9 +110,13 @@ The agent writes one JSON file to a path `prq` supplies — never stdout, never 
 
 **Identity across reruns:** each finding gets a random UUID (its address) plus a SHA-256 fingerprint over the JSON array `[kind, path, side, body]` with absent fields encoded as null and body CRLF normalized to LF. No other Markdown whitespace is removed. Line numbers are deliberately excluded. Recompute the fingerprint when an edit or conversion changes its inputs. Reuse an ID only for an unambiguous one-old-to-one-new fingerprint match within that PR; multiple candidates get fresh UUIDs. Preserve a decision only when the body is byte-identical and the complete anchor (`path`, `side`, `line`, `start_line`, `start_side`) is unchanged. Approval additionally requires the same comparison and a still-valid anchor. Changed or ambiguous findings return to `pending`, or `blocked` if invalid, and clear approval. Record changed bodies in the audit log before replacing them; ingestion must not restore decisions from a snapshot taken before the agent ran. Previously published matches remain published and are not automatically reposted. Unmatched unpublished findings become `obsolete` after a successful replacement run. Reworded findings can look new; this is an accepted v1 limitation.
 
+A rejected finding that disappears from a successful replacement output becomes `obsolete`. If it later reappears, even with an exact fingerprint/body/anchor match, it returns to `pending` (or `blocked` for an unverifiable anchor) and requires triage again. Its earlier rejection remains in the audit history. This is another accepted v1 limitation.
+
 ## 6. Notifications
 
 One optional local notification per run, only when something needs a look. Quiet on a clean run with nothing new; quiet on a repeated identical failure until it changes.
+
+The changed count covers new or changed findings in the replacement output, including its summary. Retiring unmatched findings as obsolete does not increment this count or by itself trigger a notification.
 
 Prefer `terminal-notifier` on `$PATH`; fall back to `osascript`. Both are called with fixed argument arrays — never a shell string built from PR text. Message is counts and PR identifiers only, never finding bodies. If both sinks fail, the run's own result is unaffected — you'll see it next in `prq status`.
 
