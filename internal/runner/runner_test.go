@@ -252,6 +252,9 @@ func TestCleanupPreservesLiveOwnerAndHandlesPIDReuse(t *testing.T) {
 func TestCleanupAfterCoordinatorKilled(t *testing.T) {
 	req, _ := localFixture(t)
 	r := testRunner(t, "timeout", time.Minute)
+	outerOutput := filepath.Join(t.TempDir(), "findings.json")
+	t.Setenv("PRQUEUE_OUTPUT", outerOutput)
+	t.Setenv("PRQUEUE_INPUT", "outer review input")
 	data, err := json.Marshal(req)
 	if err != nil {
 		t.Fatal(err)
@@ -259,7 +262,8 @@ func TestCleanupAfterCoordinatorKilled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0])
-	cmd.Env = append(os.Environ(), "PRQ_TEST_COORDINATOR=1", "PRQ_TEST_STATE="+r.StateDir, "PRQ_TEST_REQUEST="+string(data))
+	// This child is a coordinator, even when go test runs inside a review agent.
+	cmd.Env = append(os.Environ(), "PRQUEUE_OUTPUT=", "PRQUEUE_INPUT=", "PRQ_TEST_COORDINATOR=1", "PRQ_TEST_STATE="+r.StateDir, "PRQ_TEST_REQUEST="+string(data))
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -291,6 +295,9 @@ func TestCleanupAfterCoordinatorKilled(t *testing.T) {
 	stamp, err := processStart(t.Context(), o.AgentPID)
 	if err != nil || stamp != "" {
 		t.Fatalf("agent survived coordinator recovery: %s %v", stamp, err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(outerOutput), "child.pid")); !os.IsNotExist(err) {
+		t.Fatal("test wrote diagnostics into the enclosing review output directory")
 	}
 }
 
