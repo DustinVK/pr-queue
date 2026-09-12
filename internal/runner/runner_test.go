@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -50,7 +51,7 @@ func fakeAgent(mode string) int {
 		time.Sleep(time.Minute)
 		return 0
 	}
-	if mode == "timeout" {
+	if mode == "timeout" || mode == "success-with-child" {
 		child := exec.Command(os.Args[0])
 		child.Env = append(os.Environ(), "PRQ_RUNNER_TEST_MODE=sleep-child")
 		if err := child.Start(); err != nil {
@@ -59,8 +60,17 @@ func fakeAgent(mode string) int {
 		if err := os.WriteFile(filepath.Join(filepath.Dir(output), "child.pid"), []byte(strconv.Itoa(child.Process.Pid)), 0600); err != nil {
 			panic(err)
 		}
-		time.Sleep(time.Minute)
-		return 0
+		if mode == "timeout" {
+			time.Sleep(time.Minute)
+			return 0
+		}
+		stamp, err := processStart(context.Background(), child.Process.Pid)
+		if err != nil || stamp == "" {
+			panic(fmt.Sprintf("identify fixture child: %q %v", stamp, err))
+		}
+		if err := os.WriteFile(filepath.Join(filepath.Dir(output), "child-start.txt"), []byte(stamp), 0600); err != nil {
+			panic(err)
+		}
 	}
 	if mode == "crash" {
 		return 42
@@ -210,6 +220,51 @@ func TestRunnerCleansUpOnAgentFailures(t *testing.T) {
 				t.Fatal("worktree left after failure")
 			}
 		})
+	}
+}
+
+func TestSuccessfulAgentLeavesNoChildProcesses(t *testing.T) {
+	req, _ := localFixture(t)
+	r := testRunner(t, "success-with-child", 10*time.Second)
+	diagnostics := filepath.Dir(OutputPath(r.StateDir, req.ID))
+	// Also clean up the test-owned child if a regression makes Review omit its
+	// successful-exit group sweep. Match the recorded child identity first.
+	t.Cleanup(func() {
+		data, _ := os.ReadFile(filepath.Join(diagnostics, "child.pid"))
+		pid, _ := strconv.Atoi(string(data))
+		want, _ := os.ReadFile(filepath.Join(diagnostics, "child-start.txt"))
+		if pid < 2 || len(want) == 0 {
+			return
+		}
+		if stamp, _ := processStart(context.Background(), pid); stamp != "" && stamp == string(want) {
+			syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	result, err := r.Review(t.Context(), req)
+	if err != nil || result.TimedOut || result.Document.HeadSHA != req.Input.HeadSHA {
+		t.Fatalf("successful fixture review: %+v %v", result, err)
+	}
+	data, err := os.ReadFile(filepath.Join(diagnostics, "child.pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(data))
+	if err != nil || pid < 2 {
+		t.Fatalf("invalid fixture child PID: %q %v", data, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		stamp, err := processStart(t.Context(), pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stamp == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("agent child survived successful review")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
