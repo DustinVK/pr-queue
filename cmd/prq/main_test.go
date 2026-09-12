@@ -39,7 +39,7 @@ func TestInitConsentAndIdempotence(t *testing.T) {
 	if code != 0 || !r.OK {
 		t.Fatalf("%d %+v", code, r)
 	}
-	if !strings.Contains(diagnostics, "not a sandbox") {
+	if !strings.Contains(diagnostics, "full user permissions") || !strings.Contains(diagnostics, "workspace-write sandbox") || !strings.Contains(diagnostics, "approval guarantee") {
 		t.Fatal("missing trust disclosure")
 	}
 	custom := "# custom comment\ngithub: {user: alice}\nrepos: [{name: owner/repo}]\n"
