@@ -672,7 +672,7 @@ func TestAcceptanceExecutableProviderSwitchForceAndFailures(t *testing.T) {
 		State    string `json:"state"`
 	}
 	decodeErr := json.Unmarshal(metadata, &provenance)
-	if err != nil || decodeErr != nil || provenance.Provider != "codex" || provenance.State != "finished" {
+	if err != nil || decodeErr != nil || provenance.Provider != "codex" || provenance.State != "process_finished" {
 		t.Fatalf("Codex provenance %s: %s %v", metadataPath, metadata, err)
 	}
 	runDir := filepath.Dir(metadataPath)
