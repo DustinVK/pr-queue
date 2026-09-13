@@ -84,6 +84,13 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 	if err != nil {
 		return result, err
 	}
+	if r.separateRecoveryDir() {
+		owner.Version = 3
+		owner.ArtifactDir = filepath.Clean(r.StateDir)
+		if err := validateArtifactOwnership(r.recoveryDir(), owner); err != nil {
+			return result, err
+		}
+	}
 	if err := reserveOwner(root, owner); err != nil {
 		return result, err
 	}
@@ -92,7 +99,13 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 		if errors.As(err, &cleanupFailure) {
 			return
 		}
-		if e := removeWorktree(root); e != nil {
+		var e error
+		if owner.Version == 3 {
+			e = removeWorktreeRoot(root)
+		} else {
+			e = removeWorktree(root)
+		}
+		if e != nil {
 			err = errors.Join(err, e)
 		}
 	}()

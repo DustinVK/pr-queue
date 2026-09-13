@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/DustinVK/pr-queue/internal/config"
@@ -52,6 +53,7 @@ func (a *app) runReviews(ctx context.Context, args []string) (result any, result
 	}
 	defer l.Close()
 	var s *store.Store
+	var dryRunIDs []string
 	workDir := a.paths.State
 	if !*dry {
 		_, cleanupErr := (runner.Runner{StateDir: workDir}).Cleanup(ctx)
@@ -119,14 +121,35 @@ func (a *app) runReviews(ctx context.Context, args []string) (result any, result
 		if err != nil {
 			return nil, err
 		}
-		workDir, err = os.MkdirTemp("", "prqueue-dry-")
+		dryRunDir := filepath.Join(a.paths.State, "dry-runs")
+		if err := os.Mkdir(dryRunDir, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+			s.Close()
+			return nil, err
+		}
+		info, err := os.Lstat(dryRunDir)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			s.Close()
+			return nil, errors.Join(fmt.Errorf("dry-run artifact root is not a directory"), err)
+		}
+		if err := os.Chmod(dryRunDir, 0700); err != nil {
+			s.Close()
+			return nil, err
+		}
+		workDir, err = os.MkdirTemp(dryRunDir, "run-")
 		if err != nil {
 			s.Close()
 			return nil, err
 		}
 		defer func() {
-			if err := os.RemoveAll(workDir); err != nil {
-				resultErr = errors.Join(resultErr, &dryRunCleanupError{cause: err})
+			cleanupErr := os.RemoveAll(workDir)
+			if cleanupErr == nil {
+				recovery := runner.Runner{StateDir: workDir, RecoveryDir: a.paths.State}
+				for _, id := range dryRunIDs {
+					cleanupErr = errors.Join(cleanupErr, recovery.ReleaseArtifactOwnership(id))
+				}
+			}
+			if cleanupErr != nil {
+				resultErr = errors.Join(resultErr, &dryRunCleanupError{cause: cleanupErr})
 			}
 		}()
 		defer s.Close()
@@ -138,6 +161,7 @@ func (a *app) runReviews(ctx context.Context, args []string) (result any, result
 	if *dry {
 		for i := range r.Repos {
 			for j := range r.Repos[i].Reviews {
+				dryRunIDs = append(dryRunIDs, r.Repos[i].Reviews[j].ID)
 				r.Repos[i].Reviews[j].OutputPath = ""
 			}
 		}
