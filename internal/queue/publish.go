@@ -171,7 +171,14 @@ func (q Service) ResumePublication(ctx context.Context, ref string, confirmedNot
 			return q.publicationFailure(*p, fmt.Errorf("multiple reviews contain publication marker %s", p.Marker), true, "")
 		}
 		if len(matches) == 1 {
-			review = &matches[0]
+			matched := matches[0]
+			if matched.State == "DISMISSED" {
+				matched, err = remote.FetchReview(ctx, repo, pr, matched.ID)
+				if err != nil {
+					return q.publicationFailure(*p, err, true, matched.ID)
+				}
+			}
+			review = &matched
 		}
 	}
 	if review == nil {
@@ -217,10 +224,17 @@ func (q Service) resumePrepared(ctx context.Context, remote PublishRemote, p sto
 		return PublicationResult{Publication: &p}, err
 	}
 	byID := map[string]store.Finding{}
-	for _, f := range current {
-		byID[f.ID] = f
+	snapshotIDs := map[string]bool{}
+	for _, item := range p.Snapshot.Items {
+		snapshotIDs[item.ID] = true
 	}
 	var stale []string
+	for _, f := range current {
+		byID[f.ID] = f
+		if f.Status == "approved" && !snapshotIDs[f.ID] {
+			stale = append(stale, f.ID)
+		}
+	}
 	for _, item := range p.Snapshot.Items {
 		f, ok := byID[item.ID]
 		if !ok || !item.Matches(f) || diff.Validate(f.Finding) != nil {

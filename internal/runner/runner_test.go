@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,7 +24,7 @@ func TestMain(m *testing.M) {
 		if err := json.Unmarshal([]byte(os.Getenv("PRQ_TEST_REQUEST")), &req); err != nil {
 			panic(err)
 		}
-		r := Runner{StateDir: os.Getenv("PRQ_TEST_STATE"), Agent: config.Agent{Executable: os.Args[0], Timeout: time.Minute}}
+		r := Runner{StateDir: os.Getenv("PRQ_TEST_STATE"), RecoveryDir: os.Getenv("PRQ_TEST_RECOVERY_STATE"), Agent: config.Agent{Executable: os.Args[0], Timeout: time.Minute}}
 		_, err := r.Review(context.Background(), req)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -39,11 +40,18 @@ func TestMain(m *testing.M) {
 
 func fakeAgent(mode string) int {
 	output := os.Getenv("PRQUEUE_OUTPUT")
+	if mode == "starting-child" {
+		if err := os.WriteFile(output, []byte("ready"), 0600); err != nil {
+			panic(err)
+		}
+		time.Sleep(time.Minute)
+		return 0
+	}
 	if mode == "sleep-child" {
 		time.Sleep(time.Minute)
 		return 0
 	}
-	if mode == "timeout" {
+	if mode == "timeout" || mode == "success-with-child" {
 		child := exec.Command(os.Args[0])
 		child.Env = append(os.Environ(), "PRQ_RUNNER_TEST_MODE=sleep-child")
 		if err := child.Start(); err != nil {
@@ -52,8 +60,17 @@ func fakeAgent(mode string) int {
 		if err := os.WriteFile(filepath.Join(filepath.Dir(output), "child.pid"), []byte(strconv.Itoa(child.Process.Pid)), 0600); err != nil {
 			panic(err)
 		}
-		time.Sleep(time.Minute)
-		return 0
+		if mode == "timeout" {
+			time.Sleep(time.Minute)
+			return 0
+		}
+		stamp, err := processStart(context.Background(), child.Process.Pid)
+		if err != nil || stamp == "" {
+			panic(fmt.Sprintf("identify fixture child: %q %v", stamp, err))
+		}
+		if err := os.WriteFile(filepath.Join(filepath.Dir(output), "child-start.txt"), []byte(stamp), 0600); err != nil {
+			panic(err)
+		}
 	}
 	if mode == "crash" {
 		return 42
@@ -83,6 +100,22 @@ func fakeAgent(mode string) int {
 		if out, err := exec.Command("git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "unexpected").CombinedOutput(); err != nil {
 			fmt.Fprintln(os.Stderr, string(out))
 			return 46
+		}
+	}
+	if mode == "git-context" {
+		for _, check := range []struct {
+			args []string
+			want string
+		}{
+			{[]string{"rev-parse", "HEAD"}, input.HeadSHA},
+			{[]string{"status", "--porcelain=v1"}, ""},
+			{[]string{"config", "--get", "prqueue.testglobal"}, "preserved"},
+		} {
+			out, err := exec.Command("git", check.args...).CombinedOutput()
+			if err != nil || strings.TrimSpace(string(out)) != check.want {
+				fmt.Fprintf(os.Stderr, "agent git %v: %q %v; want %q\n", check.args, out, err, check.want)
+				return 47
+			}
 		}
 	}
 	d := findings.Document{SchemaVersion: 1, Repo: input.Repo, PR: input.PR, HeadSHA: input.HeadSHA, Summary: "Synthetic review", Verdict: "comment", Findings: []findings.Finding{}}
@@ -140,6 +173,28 @@ func testRunner(t *testing.T, mode string, timeout time.Duration) Runner {
 	return Runner{StateDir: t.TempDir(), Agent: config.Agent{Executable: os.Args[0], Timeout: timeout}}
 }
 
+func TestResolveExecutableMakesRelativeWrapperAbsolute(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(t.TempDir(), "wrapper with spaces")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(wd, wrapper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolveExecutable(relative)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != wrapper || !filepath.IsAbs(resolved) {
+		t.Fatalf("resolved %q, want %q", resolved, wrapper)
+	}
+}
+
 func TestRunnerWritesContractAndRemovesDetachedWorktree(t *testing.T) {
 	req, source := localFixture(t)
 	r := testRunner(t, "success", 10*time.Second)
@@ -187,6 +242,51 @@ func TestRunnerCleansUpOnAgentFailures(t *testing.T) {
 				t.Fatal("worktree left after failure")
 			}
 		})
+	}
+}
+
+func TestSuccessfulAgentLeavesNoChildProcesses(t *testing.T) {
+	req, _ := localFixture(t)
+	r := testRunner(t, "success-with-child", 10*time.Second)
+	diagnostics := filepath.Dir(OutputPath(r.StateDir, req.ID))
+	// Also clean up the test-owned child if a regression makes Review omit its
+	// successful-exit group sweep. Match the recorded child identity first.
+	t.Cleanup(func() {
+		data, _ := os.ReadFile(filepath.Join(diagnostics, "child.pid"))
+		pid, _ := strconv.Atoi(string(data))
+		want, _ := os.ReadFile(filepath.Join(diagnostics, "child-start.txt"))
+		if pid < 2 || len(want) == 0 {
+			return
+		}
+		if stamp, _ := processStart(context.Background(), pid); stamp != "" && stamp == string(want) {
+			syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	result, err := r.Review(t.Context(), req)
+	if err != nil || result.TimedOut || result.Document.HeadSHA != req.Input.HeadSHA {
+		t.Fatalf("successful fixture review: %+v %v", result, err)
+	}
+	data, err := os.ReadFile(filepath.Join(diagnostics, "child.pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(data))
+	if err != nil || pid < 2 {
+		t.Fatalf("invalid fixture child PID: %q %v", data, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		stamp, err := processStart(t.Context(), pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stamp == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("agent child survived successful review")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -252,6 +352,9 @@ func TestCleanupPreservesLiveOwnerAndHandlesPIDReuse(t *testing.T) {
 func TestCleanupAfterCoordinatorKilled(t *testing.T) {
 	req, _ := localFixture(t)
 	r := testRunner(t, "timeout", time.Minute)
+	outerOutput := filepath.Join(t.TempDir(), "findings.json")
+	t.Setenv("PRQUEUE_OUTPUT", outerOutput)
+	t.Setenv("PRQUEUE_INPUT", "outer review input")
 	data, err := json.Marshal(req)
 	if err != nil {
 		t.Fatal(err)
@@ -259,7 +362,8 @@ func TestCleanupAfterCoordinatorKilled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0])
-	cmd.Env = append(os.Environ(), "PRQ_TEST_COORDINATOR=1", "PRQ_TEST_STATE="+r.StateDir, "PRQ_TEST_REQUEST="+string(data))
+	// This child is a coordinator, even when go test runs inside a review agent.
+	cmd.Env = append(os.Environ(), "PRQUEUE_OUTPUT=", "PRQUEUE_INPUT=", "PRQ_TEST_COORDINATOR=1", "PRQ_TEST_STATE="+r.StateDir, "PRQ_TEST_RECOVERY_STATE=", "PRQ_TEST_REQUEST="+string(data))
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -291,6 +395,85 @@ func TestCleanupAfterCoordinatorKilled(t *testing.T) {
 	stamp, err := processStart(t.Context(), o.AgentPID)
 	if err != nil || stamp != "" {
 		t.Fatalf("agent survived coordinator recovery: %s %v", stamp, err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(outerOutput), "child.pid")); !os.IsNotExist(err) {
+		t.Fatal("test wrote diagnostics into the enclosing review output directory")
+	}
+}
+
+func TestPersistentRecoveryCleansInterruptedTemporaryRun(t *testing.T) {
+	req, _ := localFixture(t)
+	r := testRunner(t, "timeout", time.Minute)
+	r.RecoveryDir = t.TempDir()
+	dryRunRoot := filepath.Join(r.RecoveryDir, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := os.MkdirTemp(dryRunRoot, "run-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(artifacts) })
+	r.StateDir = artifacts
+	outerOutput := filepath.Join(t.TempDir(), "findings.json")
+	t.Setenv("PRQUEUE_OUTPUT", outerOutput)
+	t.Setenv("PRQUEUE_INPUT", "outer review input")
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0])
+	cmd.Env = append(os.Environ(), "PRQUEUE_OUTPUT=", "PRQUEUE_INPUT=", "PRQ_TEST_COORDINATOR=1", "PRQ_TEST_STATE="+r.StateDir, "PRQ_TEST_RECOVERY_STATE="+r.RecoveryDir, "PRQ_TEST_REQUEST="+string(data))
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+	root := filepath.Join(r.RecoveryDir, "worktrees", req.ID)
+	var o owner
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ownerData, _ := os.ReadFile(ownerPath(root))
+		o = owner{}
+		_ = json.Unmarshal(ownerData, &o)
+		if o.AgentPID > 0 && o.Released {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("agent was not released")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if o.Version != 3 || o.ArtifactDir != r.StateDir {
+		t.Fatalf("split ownership was not persisted: %+v", o)
+	}
+	if _, err := os.Stat(filepath.Join(r.StateDir, "runs", req.ID, "agent-metadata.json")); err != nil {
+		t.Fatal("temporary diagnostics missing:", err)
+	}
+	if _, err := os.Stat(filepath.Join(r.RecoveryDir, "runs", req.ID)); !os.IsNotExist(err) {
+		t.Fatal("diagnostics were retained with recovery ownership")
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = cmd.Process.Wait()
+	cleaned, err := (Runner{StateDir: r.RecoveryDir}).Cleanup(t.Context())
+	if err != nil || len(cleaned) != 1 || cleaned[0] != req.ID {
+		t.Fatalf("persistent recovery: %v %v", cleaned, err)
+	}
+	stamp, err := processStart(t.Context(), o.AgentPID)
+	if err != nil || stamp != "" {
+		t.Fatalf("agent survived persistent recovery: %s %v", stamp, err)
+	}
+	for _, path := range []string{root, ownerPath(root)} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("recovery artifact remains at %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(r.StateDir); !os.IsNotExist(err) {
+		t.Fatalf("temporary diagnostic root remains: %v", err)
 	}
 }
 

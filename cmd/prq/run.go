@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/DustinVK/pr-queue/internal/config"
@@ -17,7 +19,12 @@ import (
 	"github.com/DustinVK/pr-queue/internal/store"
 )
 
-func (a *app) runReviews(ctx context.Context, args []string) (any, error) {
+type dryRunCleanupError struct{ cause error }
+
+func (e *dryRunCleanupError) Error() string { return "remove dry-run artifacts: " + e.cause.Error() }
+func (e *dryRunCleanupError) Unwrap() error { return e.cause }
+
+func (a *app) runReviews(ctx context.Context, args []string) (result any, resultErr error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	repo := fs.String("repo", "", "repository")
@@ -45,6 +52,23 @@ func (a *app) runReviews(ctx context.Context, args []string) (any, error) {
 		return nil, err
 	}
 	defer l.Close()
+	var s *store.Store
+	var dryRunIDs []string
+	workDir := a.paths.State
+	if !*dry {
+		_, cleanupErr := (runner.Runner{StateDir: workDir}).Cleanup(ctx)
+		if cleanupErr != nil {
+			cleanupErr = fmt.Errorf("clean orphaned worktrees: %w", cleanupErr)
+		}
+		s, err = store.Open(ctx, a.paths.Database)
+		if err != nil {
+			return nil, errors.Join(cleanupErr, err)
+		}
+		defer s.Close()
+		if err := errors.Join(cleanupErr, s.FailInterruptedRuns(ctx)); err != nil {
+			return nil, err
+		}
+	}
 	cfg, err := config.Load(a.paths.Config)
 	if err != nil {
 		return nil, err
@@ -87,8 +111,6 @@ func (a *app) runReviews(ctx context.Context, args []string) (any, error) {
 	if _, err := remote.Identity(ctx, cfg.GitHub.User); err != nil {
 		return nil, err
 	}
-	var s *store.Store
-	workDir := a.paths.State
 	if *dry {
 		source, err := store.OpenReadOnly(ctx, a.paths.Database)
 		if err != nil {
@@ -99,39 +121,57 @@ func (a *app) runReviews(ctx context.Context, args []string) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		workDir, err = os.MkdirTemp("", "prqueue-dry-")
+		dryRunDir := filepath.Join(a.paths.State, "dry-runs")
+		if err := os.Mkdir(dryRunDir, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+			s.Close()
+			return nil, err
+		}
+		info, err := os.Lstat(dryRunDir)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			s.Close()
+			return nil, errors.Join(fmt.Errorf("dry-run artifact root is not a directory"), err)
+		}
+		if err := os.Chmod(dryRunDir, 0700); err != nil {
+			s.Close()
+			return nil, err
+		}
+		workDir, err = os.MkdirTemp(dryRunDir, "run-")
 		if err != nil {
 			s.Close()
 			return nil, err
 		}
-		defer os.RemoveAll(workDir)
-	} else {
-		s, err = store.Open(ctx, a.paths.Database)
-		if err != nil {
-			return nil, err
-		}
+		defer func() {
+			cleanupErr := os.RemoveAll(workDir)
+			if cleanupErr == nil {
+				recovery := runner.Runner{StateDir: workDir, RecoveryDir: a.paths.State}
+				for _, id := range dryRunIDs {
+					cleanupErr = errors.Join(cleanupErr, recovery.ReleaseArtifactOwnership(id))
+				}
+			}
+			if cleanupErr != nil {
+				resultErr = errors.Join(resultErr, &dryRunCleanupError{cause: cleanupErr})
+			}
+		}()
+		defer s.Close()
 	}
-	defer s.Close()
-	agent := runner.Runner{StateDir: workDir, Agent: cfg.Agent}
-	if !*dry {
-		if _, err := agent.Cleanup(ctx); err != nil {
-			return nil, fmt.Errorf("clean orphaned worktrees: %w", err)
-		}
-		if err := s.FailInterruptedRuns(ctx); err != nil {
-			return nil, err
-		}
-	}
+	agent := runner.Runner{StateDir: workDir, RecoveryDir: a.paths.State, Agent: cfg.Agent}
 	coordinator := queue.Coordinator{Store: s, Remote: remote, Reviewer: agent, StateDir: a.paths.State, WorkDir: workDir, Parallel: cfg.Agent.MaxParallelReviews, Source: a.source}
 	r, err := coordinator.Run(ctx, repos, *pr)
 	r.DryRun = *dry
 	if *dry {
 		for i := range r.Repos {
 			for j := range r.Repos[i].Reviews {
+				dryRunIDs = append(dryRunIDs, r.Repos[i].Reviews[j].ID)
 				r.Repos[i].Reviews[j].OutputPath = ""
 			}
 		}
 	} else if completionErr := queue.FinishRun(ctx, a.paths.State, r, a.notifications); completionErr != nil {
-		fmt.Fprintf(a.errOut, "Run completed; notification/summary warning: %s\n", completionErr)
+		var summaryErr *queue.RunSummaryError
+		if errors.As(completionErr, &summaryErr) {
+			err = errors.Join(err, completionErr)
+		} else {
+			fmt.Fprintf(a.errOut, "Run completed; notification warning: %s\n", completionErr)
+		}
 	}
 	return r, err
 }

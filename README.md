@@ -1,6 +1,6 @@
 # prqueue
 
-`prqueue` is a macOS CLI for drafting pull request reviews with Claude Code, triaging findings locally, and publishing the findings you explicitly approve. Its command is `prq`.
+`prqueue` is a macOS CLI for drafting pull request reviews with Claude Code or Codex CLI, triaging findings locally, and publishing the findings you explicitly approve. Its command is `prq`.
 
 It runs once when invoked, reviews PRs in fresh Git worktrees, and keeps the review queue in SQLite. There is no server or daemon to deploy.
 
@@ -21,7 +21,7 @@ It runs once when invoked, reviews PRs in fresh Git worktrees, and keeps the rev
 | Go 1.26+ | Build and test `prq` | Required for development |
 | Git | Fetch PR revisions and create detached worktrees | Required |
 | GitHub CLI (`gh`) | Access github.com as the configured account | Required, authenticated |
-| Claude Code (`claude`) | Generate proposed reviews | Required, authenticated through its supported local login or environment |
+| Claude Code (`claude`) or Codex CLI (`codex`) | Generate proposed reviews | Selected provider required, authenticated through its supported local login or environment |
 | `terminal-notifier` | Local desktop notifications | Optional; falls back to macOS `osascript` |
 
 No Docker or database server is required. SQLite uses the pure Go `modernc.org/sqlite` driver, so building the binary does not require a C toolchain. Development race checks do require one. Go module versions and checksums are pinned in `go.mod` and `go.sum`.
@@ -33,12 +33,10 @@ go version
 git --version
 gh --version
 gh auth status
-claude --version
-claude auth status
 command -v osascript
 ```
 
-If authentication is missing, use `gh auth login --hostname github.com` or `claude auth login` as appropriate. `github.user` must match the authenticated GitHub account. `prq` does not manage model credentials.
+For your selected provider, check `claude --version` and `claude auth status`, or `codex --version` and `codex login status`. If authentication is missing, use `gh auth login --hostname github.com`, `claude auth login`, or `codex login` as appropriate. `github.user` must match the authenticated GitHub account. `prq` does not manage model credentials or select a model; the agent CLI's configuration applies. Codex can reuse its saved ChatGPT login.
 
 ## Build and initialize
 
@@ -80,6 +78,7 @@ prq publish owner/name#482 --event COMMENT
 github:
   user: your-login
 agent:
+  provider: claude
   executable: claude
   timeout: 15m
   max_parallel_reviews: 1
@@ -91,13 +90,15 @@ repos:
       base_branches: []
 ```
 
-The configuration lives at `~/.config/prqueue/config.yaml`; the SQLite database is `~/.local/state/prqueue/queue.db`. The state directory also holds locks and the separate `agent-consent-v1` acknowledgment. Application directories use mode `0700`, and newly created configuration/state files use `0600`. Keep credentials and actual repository configuration out of this repository.
+Set `agent.provider: codex` to use Codex. Change or remove an existing `executable: claude` at the same time. An omitted executable defaults to the selected provider; explicit custom wrapper paths are preserved. Omitting the provider preserves existing Claude configurations. Keep your existing timeout, concurrency, and repository settings when switching. Unknown providers and explicitly empty/null provider or executable values fail validation; prq never silently falls back to another provider.
+
+The configuration lives at `~/.config/prqueue/config.yaml`; the SQLite database is `~/.local/state/prqueue/queue.db`. The state directory also holds locks and the separate `agent-consent-v1` acknowledgment, which remains valid after switching providers. Application directories use mode `0700`, and newly created configuration/state files use `0600`. Keep credentials and actual repository configuration out of this repository.
 
 After each normal run, `run-summary.json` in the state directory records the latest pass for each selected repository, including failures that have no PR row. `prq status` reports these alongside PR runs, lock holders, and unresolved publications. New or changed findings and new failures produce one desktop notification containing counts and repository/PR identifiers. Identical repeated failures stay quiet; notification failures are reported without changing the run's exit code.
 
-`run` observes PR state before applying filters and skips an unchanged, successfully reviewed comparison. `run --repo owner/name --pr 482` forces a fresh review, including a draft, but never a closed or merged PR. Failed reviews remain eligible for retry.
+`run` observes PR state before applying filters and skips an unchanged, successfully reviewed comparison. Provider/model changes do not clear that cursor. `run --repo owner/name --pr 482` is the force mechanism: `--pr` bypasses the successful cursor and filters, including draft exclusion, while respecting lock contention and closed/merged state. Keep `--pr` when retrying a forced review after an earlier successful comparison. To verify a provider switch, require a new succeeded run with that provider's execution metadata; exit 0 or a skipped pass is insufficient.
 
-Each review keeps `findings.json`, the prompt, and separate agent diagnostics under `~/.local/state/prqueue/runs/<run-id>/`. Worktrees are removed after success or failure. The next normal invocation recovers worktrees from dead coordinators and marks interrupted runs failed; it skips recovery while another run holds the global lock. Dry runs leave persistent run state and artifacts untouched.
+Each review keeps `findings.json`, the prompt, separate JSONL/stderr diagnostics, and private `agent-metadata.json` under `~/.local/state/prqueue/runs/<run-id>/`. Metadata identifies the provider, executable, options, and lifecycle evidence; an unreported model identity remains unknown. Codex CLI writes its schema-constrained final response to the findings file; JSONL events are never ingested as findings. Invalid output or a nonzero exit fails the attempt without replacing findings or advancing the cursor. Worktrees are removed after success or failure. The next normal invocation recovers worktrees and temporary dry-run diagnostics from dead coordinators, removes empty dry-run directories interrupted before ownership was recorded, supports current owners and legacy Claude records even after a provider switch, marks interrupted persistent runs failed, and skips recovery while another run holds the global lock. Successful dry runs retain no review artifacts or logical queue changes, but may update lock metadata and SQLite WAL coordination files.
 
 Findings can be `pending`, `approved`, `rejected`, `published`, `obsolete`, or `blocked`. The agent's summary is a separate finding that needs its own approval. Invalid inline anchors remain visible as blocked findings; `edit --as-general` removes the anchor and requires approval of the resulting general finding.
 
@@ -115,7 +116,7 @@ With no approved findings, `COMMENT` does nothing, `REQUEST_CHANGES` refuses, an
 
 Publication snapshots are frozen before sending. If delivery is uncertain, a new publication is blocked until `prq publish owner/name#482 --resume` reconciles the original attempt. It never blindly resends a possibly submitted review. For an uncertain attempt, the `--confirmed-not-sent` recovery override requires manual inspection of the PR; the override sends nothing itself. See [publishing and crash recovery](prqueue-spec.md#7-publishing-and-crash-recovery).
 
-`publish --dry-run` validates and previews the exact request without writing local or remote state. Each preview allocates a candidate recovery marker; a later separate publication allocates its own marker. An existing unresolved publication blocks preview, including an otherwise empty `COMMENT`. `run --dry-run` **does run the agent and can incur model cost**; the coordinator uses temporary files, persists no database changes, makes no GitHub writes, and sends no notification.
+`publish --dry-run` validates and previews the exact request without changing logical queue/publication data or remote state. It may update persistent lock metadata and SQLite WAL coordination files. Each preview allocates a candidate recovery marker; a later separate publication allocates its own marker. An existing unresolved publication blocks preview, including an otherwise empty `COMMENT`. `run --dry-run` **does run the agent and can incur model cost**; the coordinator uses temporary files, persists no logical database changes, makes no GitHub writes, and sends no notification.
 
 Recover an interrupted publication separately from starting a new one:
 
@@ -130,7 +131,9 @@ Recovery verifies the recorded account before reading reviews. It can finalize a
 
 ## Agent permissions
 
-Claude Code runs as trusted local code with your full user permissions, using `--dangerously-skip-permissions` for unattended execution. A fresh worktree protects the working checkout from ordinary review activity; it is not a sandbox. The agent is instructed not to commit, push, or invoke `gh`, but it can access ambient GitHub authentication. The approval guarantee applies to `prqueue`'s publisher, not to actions a misbehaving agent might take independently, including during a dry run.
+Claude Code retains full user permissions using `--dangerously-skip-permissions`. Codex runs with its native `workspace-write` command sandbox, no approval prompts, command networking disabled, and the run's scratch directory granted alongside the checkout and standard temporary roots. Some dependency installation or checks requiring additional access may be unavailable. The asymmetry is intentional for this release; tightening Claude requires a separate compatibility effort.
+
+Both agents remain trusted local code. A worktree is not a sandbox, and Codex's command policy does not isolate its entire process, loaded instructions, configured tools, or model connection. Agents are instructed not to edit source, commit, push, or invoke `gh`; ambient authentication can still exist. The approval guarantee applies to prqueue's publisher, including during dry runs.
 
 Automated polling is the [next planned extension](docs/launchd-polling-spec.md), using a per-user LaunchAgent around `prq run`. Its management commands are not implemented yet. The existing [LaunchAgent example](com.dustinvk.prqueue.plist) is not installed by `init`; the new specification describes its planned replacement. Docker isolation, a web UI, other agents, and remote notifications remain deferred.
 
@@ -148,4 +151,4 @@ go test -race ./...
 CGO_ENABLED=0 go build -o bin/prq ./cmd/prq
 ```
 
-Automated tests use temporary application directories, databases, local Git repositories, and fake GitHub/agent executables. They do not read your actual queue, invoke Claude Code, or publish real reviews. Separate manual tests require explicit environment opt-in and can incur model cost. The [phase 4 runner smoke check](docs/phase4-smoke.md) and [phase 8 integration trial](docs/phase8-validation.md) both passed. The latter detected an intentionally introduced arithmetic bug; its draft still needed human editing. Live review submission and recovery are covered by fault-injected fixtures, without a real GitHub review POST.
+Automated tests use temporary application directories, databases, local Git repositories, and fake GitHub/agent executables. They do not read your actual queue, invoke real agents, or publish real reviews. Separate provider-specific manual tests require explicit environment opt-in and can incur model cost. The [Codex runner compatibility check](docs/codex-validation.md) passed with the installed CLI and strict output schema. Historical Claude evidence is in the [phase 4 runner smoke check](docs/phase4-smoke.md) and [phase 8 integration trial](docs/phase8-validation.md). The latter detected an intentionally introduced arithmetic bug; its draft still needed human editing. Live review submission and recovery are covered by fault-injected fixtures, without a real GitHub review POST.

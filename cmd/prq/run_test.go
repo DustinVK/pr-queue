@@ -14,6 +14,7 @@ import (
 	"github.com/DustinVK/pr-queue/internal/config"
 	"github.com/DustinVK/pr-queue/internal/findings"
 	"github.com/DustinVK/pr-queue/internal/github"
+	"github.com/DustinVK/pr-queue/internal/queue"
 	"github.com/DustinVK/pr-queue/internal/store"
 	"github.com/google/uuid"
 )
@@ -151,11 +152,23 @@ func TestRunDryRunIsolatesAllPersistentState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "prqueue-dry-") {
-		t.Fatal("agent did not use temporary output")
+	dryRunRoot := filepath.Join(a.paths.State, "dry-runs")
+	rel, err := filepath.Rel(dryRunRoot, string(data))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		t.Fatalf("agent output escaped recovery-owned temporary root: %q %v", data, err)
 	}
 	if _, err := os.Stat(filepath.Dir(string(data))); !os.IsNotExist(err) {
 		t.Fatal("temporary output remained")
+	}
+	if entries, err := os.ReadDir(filepath.Join(a.paths.State, "worktrees")); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("dry-run recovery artifacts remained: %v", entries)
+	}
+	if entries, err := os.ReadDir(dryRunRoot); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("dry-run diagnostic roots remained: %v", entries)
 	}
 	var result struct {
 		OK   bool `json:"ok"`
@@ -206,5 +219,98 @@ func TestStatusRecoversInterruptedRun(t *testing.T) {
 	var status string
 	if err := s.DB.QueryRow("SELECT status FROM review_runs WHERE id=?", r.ID).Scan(&status); err != nil || status != "failed" {
 		t.Fatalf("interrupted run: %s %v", status, err)
+	}
+}
+
+func TestRunPreflightFailureStillRecoversInterruptedRun(t *testing.T) {
+	a, _, out := runFixture(t)
+	s, err := store.Open(t.Context(), a.paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	p, _, err := s.Observe(t.Context(), "owner/repo", 1, a.remote.(runRemote).pr.Comparison, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.StartRun(t.Context(), uuid.NewString(), p, "interrupted-output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(a.paths.Config, []byte("not: [valid"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.run(t.Context(), []string{"run", "--json"}); code != 1 {
+		t.Fatalf("invalid config did not fail run: code=%d stdout=%s", code, out.String())
+	}
+	var status string
+	if err := s.DB.QueryRow("SELECT status FROM review_runs WHERE id=?", r.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("preflight failure left interrupted run %q", status)
+	}
+}
+
+func TestRunDryRunReportsArtifactCleanupFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		agentFail bool
+	}{
+		{name: "cleanup only"},
+		{name: "partial and cleanup", agentFail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, marker, out := runFixture(t)
+			cfg, err := config.Load(a.paths.Config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			inner := cfg.Agent.Executable + ".inner"
+			if err := os.Rename(cfg.Agent.Executable, inner); err != nil {
+				t.Fatal(err)
+			}
+			fail := ""
+			if tc.agentFail {
+				fail = "PRQ_TEST_FAIL=1 "
+			}
+			wrapper := fmt.Sprintf(`#!/bin/sh
+%s%q "$@"
+status=$?
+root=$(dirname "$(dirname "$(dirname "$PRQUEUE_OUTPUT")")")
+mkdir "$root/protected"
+touch "$root/protected/file"
+chmod 000 "$root/protected"
+exit "$status"
+	`, fail, inner)
+			if err := os.WriteFile(cfg.Agent.Executable, []byte(wrapper), 0700); err != nil {
+				t.Fatal(err)
+			}
+			code := a.run(t.Context(), []string{"run", "--repo", "owner/repo", "--pr", "1", "--dry-run", "--json"})
+			data, err := os.ReadFile(marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			workDir := filepath.Dir(filepath.Dir(filepath.Dir(string(data))))
+			protected := filepath.Join(workDir, "protected")
+			defer os.RemoveAll(workDir)
+			defer os.Chmod(protected, 0700)
+			if code != 1 {
+				t.Fatalf("artifact cleanup failure was ignored: code=%d stdout=%s", code, out.String())
+			}
+			if tc.agentFail && (!strings.Contains(out.String(), "agent failed") || !strings.Contains(out.String(), "remove dry-run artifacts")) {
+				t.Fatalf("combined failure lost an error: %s", out.String())
+			}
+		})
+	}
+}
+
+func TestRunSummaryPersistenceFailureIsFatal(t *testing.T) {
+	a, _, out := runFixture(t)
+	if err := os.WriteFile(queue.SummaryPath(a.paths.State), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.run(t.Context(), []string{"run", "--json"}); code != 1 {
+		t.Fatalf("invalid run summary was not fatal: code=%d stdout=%s", code, out.String())
 	}
 }

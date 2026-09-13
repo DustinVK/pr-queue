@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,7 +30,9 @@ func TestMain(m *testing.M) {
 		case "gh":
 			os.Exit(fixtureGitHub(path))
 		case "fake-agent":
-			os.Exit(fixtureAgent(path))
+			os.Exit(fixtureAgent(path, "claude"))
+		case "fake-codex":
+			os.Exit(fixtureAgent(path, "codex"))
 		}
 	}
 	os.Exit(m.Run())
@@ -42,6 +46,10 @@ type submittedFixture struct {
 	ID      int
 	Request github.ReviewRequest
 }
+type agentCall struct {
+	Provider string
+	Args     []string
+}
 type cliFixture struct {
 	PR        github.PR
 	Patch     string
@@ -50,6 +58,7 @@ type cliFixture struct {
 	Posts     int
 	Reviews   []submittedFixture
 	Calls     []apiCall
+	Agents    []agentCall
 }
 
 func readFixture(path string) (cliFixture, error) {
@@ -218,11 +227,22 @@ func fixtureGitHub(path string) int {
 	return code
 }
 
-func fixtureAgent(path string) int {
-	f, err := readFixture(path)
+func fixtureAgent(path, provider string) int {
+	l, err := lockedFixture(path)
 	if err != nil {
 		return 99
 	}
+	f, err := readFixture(path)
+	if err != nil {
+		l.Close()
+		return 99
+	}
+	f.Agents = append(f.Agents, agentCall{Provider: provider, Args: append([]string(nil), os.Args[1:]...)})
+	if err := writeFixture(path, f); err != nil {
+		l.Close()
+		return 99
+	}
+	l.Close()
 	if err := os.WriteFile(path+".agent-started", []byte("started"), 0600); err != nil {
 		return 99
 	}
@@ -241,6 +261,11 @@ func fixtureAgent(path string) int {
 	if err := json.Unmarshal([]byte(os.Getenv("PRQUEUE_INPUT")), &input); err != nil {
 		return 99
 	}
+	prompt, err := io.ReadAll(os.Stdin)
+	if err != nil || !bytes.Contains(prompt, []byte(input.Repo)) || !bytes.Contains(prompt, []byte(input.HeadSHA)) {
+		fmt.Fprintln(os.Stderr, "invalid agent prompt")
+		return 99
+	}
 	doc := findings.Document{SchemaVersion: 1, Repo: input.Repo, PR: input.PR, HeadSHA: input.HeadSHA, Summary: "SUMMARY stays private unless approved", Verdict: "request_changes", Findings: []findings.Finding{
 		{Kind: "inline", Severity: "major", Category: "correctness", Title: "PRIVATE title A", Body: "Approved A\n", Rationale: findings.Ptr("PRIVATE rationale"), Anchor: findings.Anchor{Path: findings.Ptr("value.txt"), Side: findings.Ptr("RIGHT"), Line: findings.Ptr(1)}},
 		{Kind: "general", Severity: "minor", Category: "test-coverage", Title: "PRIVATE title B", Body: "Rejected B"},
@@ -249,10 +274,83 @@ func fixtureAgent(path string) int {
 	if err != nil {
 		return 99
 	}
-	if err := os.WriteFile(os.Getenv("PRQUEUE_OUTPUT"), data, 0600); err != nil {
+	output := os.Getenv("PRQUEUE_OUTPUT")
+	if provider == "codex" {
+		args := os.Args[1:]
+		if len(args) < 2 || args[0] != "--ask-for-approval" || args[1] != "never" || !containsArgs(args, "exec", "--sandbox", "workspace-write", "sandbox_workspace_write.network_access=false", "sandbox_workspace_write.writable_roots=[]", "--ephemeral", "--json") || containsArgs(args, "--dangerously-skip-permissions") {
+			fmt.Fprintln(os.Stderr, "unexpected Codex arguments")
+			return 99
+		}
+		output = flagValue(args, "--output-last-message")
+		if output == "" || output != os.Getenv("PRQUEUE_OUTPUT") || flagValue(args, "--output-schema") == "" || flagValue(args, "--add-dir") == "" || args[len(args)-1] != "-" {
+			fmt.Fprintln(os.Stderr, "missing Codex output contract")
+			return 99
+		}
+		fmt.Println(`{"type":"thread.started","thread_id":"fixture-thread"}`)
+		fmt.Fprintln(os.Stderr, "fixture codex diagnostic")
+	} else if !containsArgs(os.Args[1:], "--output-format", "stream-json", "--dangerously-skip-permissions") || containsArgs(os.Args[1:], "exec") {
+		fmt.Fprintln(os.Stderr, "unexpected Claude arguments")
 		return 99
 	}
+	switch f.AgentMode {
+	case "missing-output":
+		return 0
+	case "malformed-output":
+		data = []byte(`{"schema_version":`)
+	}
+	if err := os.WriteFile(output, data, 0600); err != nil {
+		return 99
+	}
+	if f.AgentMode == "nonzero-with-output" {
+		return 42
+	}
 	return 0
+}
+
+func flagValue(args []string, name string) string {
+	for i := range len(args) - 1 {
+		if args[i] == name {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func containsArgs(args []string, values ...string) bool {
+	for _, value := range values {
+		found := false
+		for _, arg := range args {
+			if arg == value {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func selectCodex(t *testing.T, a app) {
+	t.Helper()
+	cfg, err := config.Load(a.paths.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(a.paths.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexExecutable := filepath.Join(filepath.Dir(cfg.Agent.Executable), "fake-codex")
+	updated := strings.Replace(string(data), "agent: {executable:", "agent: {provider: codex, executable:", 1)
+	updated = strings.Replace(updated, cfg.Agent.Executable, codexExecutable, 1)
+	if updated == string(data) {
+		t.Fatalf("fixture config has unexpected agent form: %s", data)
+	}
+	if err := os.WriteFile(a.paths.Config, []byte(updated), 0600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func acceptanceApp(t *testing.T) (app, string, *bytes.Buffer) {
@@ -277,8 +375,8 @@ func acceptanceApp(t *testing.T) (app, string, *bytes.Buffer) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, target := range []string{gh, cfg.Agent.Executable} {
-		if err := os.Remove(target); err != nil {
+	for _, target := range []string{gh, cfg.Agent.Executable, filepath.Join(filepath.Dir(cfg.Agent.Executable), "fake-codex")} {
+		if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
 			t.Fatal(err)
 		}
 		if err := os.Symlink(executable, target); err != nil {
@@ -337,6 +435,40 @@ func findingBody(t *testing.T, fs []store.Finding, body string) store.Finding {
 	}
 	t.Fatalf("finding body %q not found", body)
 	return store.Finding{}
+}
+
+func runFilesSnapshot(t *testing.T, state string) string {
+	t.Helper()
+	var snapshot []string
+	for _, root := range []string{filepath.Join(state, "runs"), queue.SummaryPath(state)} {
+		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(state, path)
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				snapshot = append(snapshot, rel+"/")
+				return nil
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			snapshot = append(snapshot, rel+":"+string(data))
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	sort.Strings(snapshot)
+	return strings.Join(snapshot, "\n")
 }
 
 func TestAcceptanceExecutableApprovalSelectionAndLostResponseRecovery(t *testing.T) {
@@ -479,6 +611,137 @@ func TestAcceptanceExecutableCrashRetryAndComparisonTransitions(t *testing.T) {
 	cliCall(t, &a, out, 0, "run")
 }
 
+func TestAcceptanceExecutableProviderSwitchForceAndFailures(t *testing.T) {
+	a, path, out := acceptanceApp(t)
+	cliCall(t, &a, out, 0, "run")
+	s, err := store.OpenReadOnly(t.Context(), a.paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var initialRunID string
+	err = s.DB.QueryRow("SELECT id FROM review_runs WHERE status='succeeded'").Scan(&initialRunID)
+	s.Close()
+	if err != nil || initialRunID == "" {
+		t.Fatalf("initial persisted Claude run: %q %v", initialRunID, err)
+	}
+	initial, err := readFixture(path)
+	if err != nil || len(initial.Agents) != 1 || initial.Agents[0].Provider != "claude" {
+		t.Fatalf("initial Claude execution: %+v %v", initial.Agents, err)
+	}
+
+	selectCodex(t, a)
+	cfg, err := config.Load(a.paths.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(filepath.Dir(cfg.Agent.Executable), "fake-agent")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(cfg.Agent.Executable)+string(os.PathListSeparator)+"/usr/bin:/bin")
+	cliCall(t, &a, out, 0, "run")
+	var ordinary struct {
+		Data queue.RunResult `json:"data"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &ordinary); err != nil || len(ordinary.Data.Repos) != 1 || len(ordinary.Data.Repos[0].Reviews) != 0 || len(ordinary.Data.Repos[0].Observations) != 1 || ordinary.Data.Repos[0].Observations[0].Eligible {
+		t.Fatalf("unchanged provider switch was not an explicit no-review skip: %s %v", out, err)
+	}
+	skipped, err := readFixture(path)
+	if err != nil || len(skipped.Agents) != 1 {
+		t.Fatalf("provider switch should skip unchanged comparison: %+v %v", skipped.Agents, err)
+	}
+
+	cliCall(t, &a, out, 0, "run", "--repo", "owner/repo", "--pr", "1")
+	var forced struct {
+		Data queue.RunResult `json:"data"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &forced); err != nil || len(forced.Data.Repos) != 1 || len(forced.Data.Repos[0].Reviews) != 1 {
+		t.Fatalf("forced result did not contain one review: %s %v", out, err)
+	}
+	review := forced.Data.Repos[0].Reviews[0]
+	if review.ID == "" || review.ID == initialRunID || review.Status != "succeeded" || review.OutputPath == "" {
+		t.Fatalf("forced review was not a new persisted success: %+v", review)
+	}
+	f, err := readFixture(path)
+	if err != nil || len(f.Agents) != 2 || f.Agents[1].Provider != "codex" {
+		t.Fatalf("forced Codex invocation: %+v %v", f.Agents, err)
+	}
+	metadataPath := filepath.Join(a.paths.State, "runs", review.ID, "agent-metadata.json")
+	metadata, err := os.ReadFile(metadataPath)
+	var provenance struct {
+		Provider string `json:"provider"`
+		State    string `json:"state"`
+	}
+	decodeErr := json.Unmarshal(metadata, &provenance)
+	if err != nil || decodeErr != nil || provenance.Provider != "codex" || provenance.State != "process_finished" {
+		t.Fatalf("Codex provenance %s: %s %v", metadataPath, metadata, err)
+	}
+	runDir := filepath.Dir(metadataPath)
+	events, eventsErr := os.ReadFile(filepath.Join(runDir, "agent.jsonl"))
+	diagnostics, diagnosticsErr := os.ReadFile(filepath.Join(runDir, "agent-stderr.log"))
+	final, finalErr := os.ReadFile(review.OutputPath)
+	if eventsErr != nil || diagnosticsErr != nil || finalErr != nil || !bytes.Contains(events, []byte("thread.started")) || !bytes.Contains(diagnostics, []byte("fixture codex diagnostic")) || bytes.Contains(final, []byte("thread.started")) {
+		t.Fatalf("Codex diagnostic/final channels were not separate: events=%q diagnostics=%q final=%q errors=%v/%v/%v", events, diagnostics, final, eventsErr, diagnosticsErr, finalErr)
+	}
+	s, err = store.OpenReadOnly(t.Context(), a.paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persistedStatus, persistedOutput, persistedComparison string
+	err = s.DB.QueryRow("SELECT status,raw_output_path,comparison_key FROM review_runs WHERE id=?", review.ID).Scan(&persistedStatus, &persistedOutput, &persistedComparison)
+	s.Close()
+	if err != nil || persistedStatus != "succeeded" || persistedOutput != review.OutputPath || persistedComparison != initial.PR.Key() {
+		t.Fatalf("persisted forced run: %q %q %q %v", persistedStatus, persistedOutput, persistedComparison, err)
+	}
+
+	for _, mode := range []string{"nonzero-with-output", "malformed-output", "missing-output"} {
+		changeFixture(t, path, func(f *cliFixture) { f.AgentMode = mode })
+		cliCall(t, &a, out, 2, "run", "--repo", "owner/repo", "--pr", "1")
+	}
+	f, err = readFixture(path)
+	if err != nil || len(f.Agents) != 5 {
+		t.Fatalf("forced retries did not each invoke Codex: %+v %v", f.Agents, err)
+	}
+	for _, call := range f.Agents[1:] {
+		if call.Provider != "codex" {
+			t.Fatalf("provider fallback occurred: %+v", f.Agents)
+		}
+	}
+	changeFixture(t, path, func(f *cliFixture) {
+		f.AgentMode = ""
+		f.PR.State = "closed"
+	})
+	cliCall(t, &a, out, 0, "run", "--repo", "owner/repo", "--pr", "1")
+	var closed struct {
+		Data queue.RunResult `json:"data"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &closed); err != nil || len(closed.Data.Repos) != 1 || len(closed.Data.Repos[0].Reviews) != 0 || len(closed.Data.Repos[0].Observations) != 1 || closed.Data.Repos[0].Observations[0].Eligible {
+		t.Fatalf("closed forced PR could be mistaken for acceptance: %s %v", out, err)
+	}
+	f, err = readFixture(path)
+	if err != nil || len(f.Agents) != 5 {
+		t.Fatalf("ineligible forced PR invoked an agent: %+v %v", f.Agents, err)
+	}
+}
+
+func TestAcceptanceMissingSelectedProviderDoesNotRequireOtherProvider(t *testing.T) {
+	a, _, out := acceptanceApp(t)
+	selectCodex(t, a)
+	cfg, err := config.Load(a.paths.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(cfg.Agent.Executable); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	code := a.run(t.Context(), []string{"run", "--repo", "owner/repo", "--pr", "1", "--json"})
+	var response result
+	decodeErr := json.Unmarshal(out.Bytes(), &response)
+	if code != 1 || decodeErr != nil || !strings.Contains(response.Error, "required executable") || !strings.Contains(response.Error, cfg.Agent.Executable) || strings.Contains(response.Error, "fake-agent") {
+		t.Fatalf("provider-aware dependency failure: code=%d %s", code, out)
+	}
+}
+
 func TestAcceptanceExecutablePreparedAndSendingRecovery(t *testing.T) {
 	for _, sending := range []bool{false, true} {
 		t.Run(strconv.FormatBool(sending), func(t *testing.T) {
@@ -562,18 +825,39 @@ func TestAcceptanceExecutableAgentAndApprovalOverlap(t *testing.T) {
 }
 
 func TestAcceptanceNotificationFailureDoesNotChangeExitAndDryRunKeepsSummary(t *testing.T) {
-	a, _, out := acceptanceApp(t)
+	a, path, out := acceptanceApp(t)
 	sink := &cliNotification{err: fmt.Errorf("desktop unavailable")}
 	a.notifications = sink
 	cliCall(t, &a, out, 0, "run")
-	before, err := os.ReadFile(queue.SummaryPath(a.paths.State))
+	selectCodex(t, a)
+	beforeDatabase := databaseSnapshot(t, a.paths.Database)
+	beforeFiles := runFilesSnapshot(t, a.paths.State)
+	changeFixture(t, path, func(f *cliFixture) { f.PR.Draft = true })
+	cliCall(t, &a, out, 0, "run", "--repo", "owner/repo", "--pr", "1", "--dry-run")
+	var response struct {
+		Data queue.RunResult `json:"data"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil || len(response.Data.Repos) != 1 || len(response.Data.Repos[0].Reviews) != 1 || response.Data.Repos[0].Reviews[0].OutputPath != "" {
+		t.Fatalf("dry-run output exposed a temporary path: %s %v", out, err)
+	}
+	if after := databaseSnapshot(t, a.paths.Database); after != beforeDatabase {
+		t.Fatal("dry run changed one of the five persistent tables")
+	}
+	if after := runFilesSnapshot(t, a.paths.State); after != beforeFiles || len(sink.messages) != 1 {
+		t.Fatal("dry run changed persisted run files/summary or notified")
+	}
+	fixture, err := readFixture(path)
+	if err != nil || len(fixture.Agents) != 2 || fixture.Agents[1].Provider != "codex" {
+		t.Fatalf("dry run did not exercise the selected executable: %+v %v", fixture.Agents, err)
+	}
+	s, err := store.OpenReadOnly(t.Context(), a.paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cliCall(t, &a, out, 0, "run", "--repo", "owner/repo", "--pr", "1", "--dry-run")
-	after, err := os.ReadFile(queue.SummaryPath(a.paths.State))
-	if err != nil || !bytes.Equal(before, after) || len(sink.messages) != 1 {
-		t.Fatal("dry run changed summary or notified")
+	p, err := s.PR(t.Context(), "owner/repo", 1)
+	s.Close()
+	if err != nil || p.Draft {
+		t.Fatalf("dry-run observation escaped the clone: %+v %v", p, err)
 	}
 	cliCall(t, &a, out, 0, "status")
 	if !strings.Contains(out.String(), "desktop unavailable") {

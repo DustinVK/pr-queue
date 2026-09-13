@@ -20,12 +20,18 @@ import (
 	"github.com/DustinVK/pr-queue/internal/lock"
 	"github.com/DustinVK/pr-queue/internal/notify"
 	"github.com/DustinVK/pr-queue/internal/queue"
+	"github.com/DustinVK/pr-queue/internal/runner"
 	"github.com/DustinVK/pr-queue/internal/store"
 )
 
-const trustNotice = `Claude Code runs with your full user permissions and can access ambient GitHub authentication.
-A worktree is not a sandbox. The agent is instructed not to commit, push, or invoke gh;
-prqueue's approval guarantee applies only to its own publisher, not to an agent acting independently.
+const trustNotice = `prqueue runs the configured Claude Code or Codex CLI as a trusted local review agent.
+Claude Code runs with your full user permissions. Codex commands use its native workspace-write sandbox,
+with command network access disabled and writes limited to the checkout, private run
+scratch space, and Codex's standard temporary roots. This does not isolate the whole Codex process.
+Both providers can use ambient model and GitHub authentication and may load local tools and configuration.
+A worktree is not a sandbox.
+The agent is instructed not to commit, push, or invoke gh; prqueue's approval guarantee applies
+only to its own publisher, not to an agent acting independently.
 `
 
 const usage = `Usage: prq <command> [options] [--json]
@@ -36,7 +42,7 @@ Available:
   list [--repo R] [--status S] List local findings
   show <owner/name#N>          Show findings and historical publications
   diff <finding-id>           Show a finding against the current PR diff
-  run [--repo R] [--pr N] [--dry-run] Draft reviews into the local queue
+  run [--repo R] [--pr N] [--dry-run] Draft reviews with the configured Claude or Codex provider
   approve <finding-id>...      Approve current, valid findings for one PR
   reject <finding-id>... [--reason TEXT] Reject findings locally
   edit <finding-id> [--as-general] Edit the body with $EDITOR
@@ -84,8 +90,13 @@ func (a *app) run(ctx context.Context, args []string) int {
 	var data any
 	var err error
 	switch command {
-	case "init", "status", "list", "show", "diff", "approve", "reject", "edit", "publish":
-		err = a.recoverInterrupted(ctx, args)
+	case "status", "list", "show", "diff", "approve", "reject", "edit", "publish":
+		err = a.recoverInterrupted(ctx, command, args)
+		var warning *recoveryWarning
+		if errors.As(err, &warning) {
+			fmt.Fprintf(a.errOut, "Startup recovery warning: %s\n", warning)
+			err = nil
+		}
 	}
 	if err == nil {
 		switch command {
@@ -126,6 +137,14 @@ func (a *app) run(ctx context.Context, args []string) int {
 		var partial *queue.PartialFailure
 		if errors.As(err, &partial) {
 			code = 2
+		}
+		var summaryErr *queue.RunSummaryError
+		if errors.As(err, &summaryErr) {
+			code = 1
+		}
+		var cleanupErr *dryRunCleanupError
+		if errors.As(err, &cleanupErr) {
+			code = 1
 		}
 		r.Error = err.Error()
 		fmt.Fprintln(a.errOut, err)
@@ -169,6 +188,16 @@ func (a *app) init(ctx context.Context, args []string) (any, error) {
 		return nil, err
 	}
 	defer l.Close()
+	_, cleanupErr := (runner.Runner{StateDir: a.paths.State}).Cleanup(ctx)
+	if cleanupErr != nil {
+		cleanupErr = fmt.Errorf("clean orphaned worktrees: %w", cleanupErr)
+	}
+	if ctx.Err() != nil {
+		return nil, errors.Join(ctx.Err(), cleanupErr)
+	}
+	if cleanupErr != nil {
+		fmt.Fprintf(a.errOut, "Startup recovery warning: %s\n", cleanupErr)
+	}
 	ack, err := a.paths.Consented()
 	if err != nil {
 		return nil, err
@@ -196,6 +225,9 @@ func (a *app) init(ctx context.Context, args []string) (any, error) {
 	s, err := store.Create(ctx, a.paths.Database)
 	if err != nil {
 		return nil, err
+	}
+	if err = s.FailInterruptedRuns(ctx); err != nil {
+		return nil, errors.Join(err, s.Close())
 	}
 	if err = s.Close(); err != nil {
 		return nil, err
