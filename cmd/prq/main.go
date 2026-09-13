@@ -24,9 +24,14 @@ import (
 	"github.com/DustinVK/pr-queue/internal/store"
 )
 
-const trustNotice = `Claude Code runs with your full user permissions and can access ambient GitHub authentication.
-A worktree is not a sandbox. The agent is instructed not to commit, push, or invoke gh;
-prqueue's approval guarantee applies only to its own publisher, not to an agent acting independently.
+const trustNotice = `prqueue runs the configured Claude Code or Codex CLI as a trusted local review agent.
+Claude Code runs with your full user permissions. Codex commands use its native workspace-write sandbox,
+with command network access disabled and writes limited to the checkout, private run
+scratch space, and Codex's standard temporary roots. This does not isolate the whole Codex process.
+Both providers can use ambient model and GitHub authentication and may load local tools and configuration.
+A worktree is not a sandbox.
+The agent is instructed not to commit, push, or invoke gh; prqueue's approval guarantee applies
+only to its own publisher, not to an agent acting independently.
 `
 
 const usage = `Usage: prq <command> [options] [--json]
@@ -37,7 +42,7 @@ Available:
   list [--repo R] [--status S] List local findings
   show <owner/name#N>          Show findings and historical publications
   diff <finding-id>           Show a finding against the current PR diff
-  run [--repo R] [--pr N] [--dry-run] Draft reviews into the local queue
+  run [--repo R] [--pr N] [--dry-run] Draft reviews with the configured Claude or Codex provider
   approve <finding-id>...      Approve current, valid findings for one PR
   reject <finding-id>... [--reason TEXT] Reject findings locally
   edit <finding-id> [--as-general] Edit the body with $EDITOR

@@ -29,3 +29,17 @@ The installed backend accepted the full six-variant findings schema. The CLI con
 A separate local `codex debug prompt-input` inspection with the same permission overrides rendered approval `never`, restricted network, and only the checkout, scratch, and standard macOS temporary writable roots. This establishes effective configuration; the smoke did not attempt an external connection or a denied write. The fixture had no test suite or dependencies to install. This check establishes invocation and output compatibility, not review quality or whole-process isolation.
 
 Final offline package and CLI validation is recorded with the implementation delivery.
+
+## Complete CLI validation
+
+The complete CLI and the independent runner layer passed formatting, vet, ordinary tests, race checks, cgo-free builds, and whitespace checks. The new CLI fixtures exercise actual fake-provider executables through the shared runner. They verify a successful Claude comparison remains skipped after switching providers, then `--pr` creates a distinct succeeded Codex run with the same persisted comparison and separate final/provenance/diagnostic files. They also cover Codex without Claude on PATH, missing selected executables, forced failures and retries without fallback, closed-PR rejection, and dry-run isolation of all five database tables, observations, files, output paths, summaries, and notifications.
+
+Lifecycle tests verify both pipe descriptor boundaries, real owner-save/release-write/empty-identity failures, concurrent helper launches, and coordinator death before identity persistence, before release, and after release. Legacy Claude ownership remains recoverable while Codex is selected. Corrupt/unknown ownership remains available for diagnosis, and independent entries are still attempted.
+
+For a deliberate live provider-switch check, keep `--pr` on the command and every retry:
+
+```sh
+prq run --repo owner/name --pr 482 --json
+```
+
+Require a new review-run ID with status `succeeded`, verify that same persisted comparison and raw findings file, and inspect its Codex session evidence. An exit code of zero, an empty reviews list, or prepared metadata does not establish that an agent reviewed content. This command queues proposals; publication still requires separate human approval and an explicitly selected review event.
