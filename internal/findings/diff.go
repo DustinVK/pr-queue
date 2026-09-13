@@ -265,6 +265,9 @@ func unquotePath(s string) (string, error) {
 }
 
 func patchPath(s, prefix string) (string, error) {
+	// Git terminates unquoted ---/+++ paths containing spaces with a tab.
+	// A tab inside the filename is quoted as \t, so retain that escaped byte.
+	s, _, _ = strings.Cut(s, "\t")
 	path, err := unquotePath(s)
 	if err != nil {
 		return "", err
@@ -295,6 +298,15 @@ func diffPaths(s string) (string, string, error) {
 			}
 		}
 		return "", "", fmt.Errorf("invalid quoted diff header")
+	}
+	// Unquoted paths can themselves contain " b/". For unchanged names,
+	// equal old/new halves identify the separator even without text headers
+	// (binary and mode-only changes). Renames use their extended headers.
+	if len(s) >= 5 && len(s)%2 == 1 && strings.HasPrefix(s, "a/") {
+		sep := (len(s) - 1) / 2
+		if s[sep:sep+3] == " b/" && s[2:sep] == s[sep+3:] {
+			return s[2:sep], s[sep+3:], nil
+		}
 	}
 	sep := strings.Index(s, " b/")
 	if sep < 0 {

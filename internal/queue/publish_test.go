@@ -179,6 +179,24 @@ func TestLostResponseAndSenderDeathRecoverAfterPRCloses(t *testing.T) {
 	}
 }
 
+func TestLostResponseDismissedApprovalReconciles(t *testing.T) {
+	q, remote, fs := publicationService(t)
+	approveTestItems(t, q, fs)
+	remote.mode = "accepted response lost"
+	if _, err := q.Publish(t.Context(), "owner/repo#1", "APPROVE"); err == nil {
+		t.Fatal("expected lost response")
+	}
+	remote.reviews[0].State = "DISMISSED"
+	remote.reviews[0].DismissedState = "APPROVED"
+	r, err := q.ResumePublication(t.Context(), "owner/repo#1", false)
+	if err != nil || r.Publication == nil || r.Publication.Status != "published" || remote.posts != 1 {
+		t.Fatalf("dismissed approval recovery: %+v posts=%d %v", r, remote.posts, err)
+	}
+	if !strings.Contains(","+strings.Join(remote.reads, ",")+",", ",review,") {
+		t.Fatalf("dismissed marker match was not fetched by ID: %v", remote.reads)
+	}
+}
+
 func TestCrashBeforePOSTIsNeverBlindlyResent(t *testing.T) {
 	q, remote, fs := publicationService(t)
 	approveTestItems(t, q, fs)
@@ -317,6 +335,42 @@ func TestPreparedSnapshotStalenessIncludesEmptyApproval(t *testing.T) {
 			stored, err := q.Store.Publication(t.Context(), p.ID)
 			if err != nil || stored.Snapshot.Request.Body != p.Snapshot.Request.Body {
 				t.Fatal("stale snapshot changed")
+			}
+		})
+	}
+}
+
+func TestPreparedSnapshotRejectsNewApprovals(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		event string
+		seed  bool
+	}{
+		{name: "comment", event: "COMMENT", seed: true},
+		{name: "empty approval", event: "APPROVE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q, remote, fs := publicationService(t)
+			if tc.seed {
+				if _, err := q.Approve(t.Context(), []string{fs[0].ID}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prepared := prepareTestPublication(t, q, tc.event)
+			if _, err := q.Approve(t.Context(), []string{fs[1].ID}); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := q.ResumePublication(t.Context(), "owner/repo#1", false)
+			if err == nil || remote.posts != 0 {
+				t.Fatalf("stale prepared selection was sent: result=%+v posts=%d err=%v", result, remote.posts, err)
+			}
+			stored, err := q.Store.Publication(t.Context(), prepared.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status != "failed" || stored.Uncertain {
+				t.Fatalf("stale prepared selection not failed definitely: %+v", stored)
 			}
 		})
 	}

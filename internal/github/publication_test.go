@@ -107,8 +107,44 @@ func TestReviewReadsRequireCompletePagination(t *testing.T) {
 	}
 }
 
+func TestDismissedReviewsRequireRecordedPreviousState(t *testing.T) {
+	request := sampleRequest()
+	request.Event = "APPROVE"
+	dismissed := strings.Replace(sampleReviewJSON(request.Body), `"state":"COMMENTED"`, `"state":"DISMISSED"`, 1)
+	for _, reviewID := range []string{"123", `"123"`} {
+		t.Run(reviewID, func(t *testing.T) {
+			c := Client{Exec: func(_ context.Context, args []string, _ []byte) Response {
+				endpoint := args[len(args)-1]
+				if strings.Contains(endpoint, "/events?") {
+					return Response{Stdout: []byte(fmt.Sprintf(`[[{"event":"review_dismissed","dismissed_review":{"review_id":%s,"state":"approved"}}],[]]`, reviewID))}
+				}
+				return Response{Stdout: []byte(dismissed)}
+			}}
+			review, err := c.FetchReview(t.Context(), "owner/repo", 1, "123")
+			if err != nil || review.DismissedState != "APPROVED" || review.Matches("reviewer", request) != nil {
+				t.Fatalf("dismissed review: %+v %v", review, err)
+			}
+		})
+	}
+
+	for _, events := range []string{
+		`[[]]`,
+		`[[{"event":"review_dismissed","dismissed_review":{"review_id":123,"state":"changes_requested"}},{"event":"review_dismissed","dismissed_review":{"review_id":123,"state":"approved"}}]]`,
+	} {
+		c := Client{Exec: func(_ context.Context, args []string, _ []byte) Response {
+			if strings.Contains(args[len(args)-1], "/events?") {
+				return Response{Stdout: []byte(events)}
+			}
+			return Response{Stdout: []byte(dismissed)}
+		}}
+		if _, err := c.FetchReview(t.Context(), "owner/repo", 1, "123"); err == nil {
+			t.Fatalf("accepted dismissal history %s", events)
+		}
+	}
+}
+
 func TestCommentsUseOriginalCompleteAnchorsAfterPush(t *testing.T) {
-	raw := fmt.Sprintf(`[[{"id":8,"pull_request_review_id":999}],[{"id":9,"pull_request_review_id":123,"user":{"login":"reviewer"},"body":"exact","path":"file.go","side":"RIGHT","start_side":"LEFT","line":null,"start_line":null,"original_line":12,"original_start_line":10,"original_commit_id":%q,"commit_id":%q}]]`, strings.Repeat("a", 40), strings.Repeat("b", 40))
+	raw := fmt.Sprintf(`[[{"id":8,"pull_request_review_id":999}],[{"id":9,"pull_request_review_id":123,"user":{"login":"reviewer"},"body":"exact","path":"file.go","side":"RIGHT","start_side":"LEFT","line":null,"start_line":null,"original_line":12,"original_start_line":10,"original_commit_id":%q,"commit_id":%q},{"id":10,"pull_request_review_id":123,"in_reply_to_id":9}]]`, strings.Repeat("a", 40), strings.Repeat("b", 40))
 	c := Client{Exec: func(_ context.Context, args []string, _ []byte) Response {
 		if args[len(args)-1] != "repos/owner/repo/pulls/1/comments?per_page=100" || !slices.Contains(args, "--paginate") {
 			t.Errorf("comment endpoint: %v", args)
