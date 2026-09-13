@@ -100,3 +100,38 @@ func TestRunCleanupFailureStillFailsInterruptedRuns(t *testing.T) {
 		t.Fatalf("interrupted run remained %q after cleanup failure", status)
 	}
 }
+
+func TestRejectReasonNamedDryRunDoesNotSkipRecovery(t *testing.T) {
+	a, _, out := runFixture(t)
+	if code := a.run(t.Context(), []string{"run", "--json"}); code != 0 {
+		t.Fatalf("run: code=%d stdout=%s", code, out.String())
+	}
+	s, err := store.Open(t.Context(), a.paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	items, err := s.ListFindings(t.Context(), "", "", 0)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("findings: %v %+v", err, items)
+	}
+	p, err := s.PR(t.Context(), "owner/repo", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.StartRun(t.Context(), uuid.NewString(), p, "interrupted-output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if code := a.run(t.Context(), []string{"reject", items[0].ID, "--reason", "--dry-run", "--json"}); code != 0 {
+		t.Fatalf("reject: code=%d stdout=%s", code, out.String())
+	}
+	var status string
+	if err := s.DB.QueryRow("SELECT status FROM review_runs WHERE id=?", r.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("reason named --dry-run left interrupted run %q", status)
+	}
+}
