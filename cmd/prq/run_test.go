@@ -152,8 +152,10 @@ func TestRunDryRunIsolatesAllPersistentState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "prqueue-dry-") {
-		t.Fatal("agent did not use temporary output")
+	dryRunRoot := filepath.Join(a.paths.State, "dry-runs")
+	rel, err := filepath.Rel(dryRunRoot, string(data))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		t.Fatalf("agent output escaped recovery-owned temporary root: %q %v", data, err)
 	}
 	if _, err := os.Stat(filepath.Dir(string(data))); !os.IsNotExist(err) {
 		t.Fatal("temporary output remained")
@@ -162,6 +164,11 @@ func TestRunDryRunIsolatesAllPersistentState(t *testing.T) {
 		t.Fatal(err)
 	} else if len(entries) != 0 {
 		t.Fatalf("dry-run recovery artifacts remained: %v", entries)
+	}
+	if entries, err := os.ReadDir(dryRunRoot); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("dry-run diagnostic roots remained: %v", entries)
 	}
 	var result struct {
 		OK   bool `json:"ok"`

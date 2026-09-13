@@ -94,7 +94,7 @@ After each normal run, `run-summary.json` in the state directory records the lat
 
 `run` observes PR state before applying filters and skips an unchanged, successfully reviewed comparison. `run --repo owner/name --pr 482` forces a fresh review, including a draft, but never a closed or merged PR. Failed reviews remain eligible for retry.
 
-Each review keeps `findings.json`, the prompt, and separate agent diagnostics under `~/.local/state/prqueue/runs/<run-id>/`. Worktrees are removed after success or failure. The next normal invocation recovers worktrees from dead coordinators and marks interrupted runs failed; it skips recovery while another run holds the global lock. Dry runs leave logical queue records and retained review artifacts untouched, but may update lock metadata and SQLite WAL coordination files.
+Each review keeps `findings.json`, the prompt, and separate agent diagnostics under `~/.local/state/prqueue/runs/<run-id>/`. Worktrees are removed after success or failure. The next normal invocation recovers worktrees and temporary dry-run diagnostics from dead coordinators and marks interrupted persistent runs failed; it skips recovery while another run holds the global lock. Successful dry runs retain no review artifacts or logical queue changes, but may update lock metadata and SQLite WAL coordination files.
 
 Findings can be `pending`, `approved`, `rejected`, `published`, `obsolete`, or `blocked`. The agent's summary is a separate finding that needs its own approval. Invalid inline anchors remain visible as blocked findings; `edit --as-general` removes the anchor and requires approval of the resulting general finding.
 

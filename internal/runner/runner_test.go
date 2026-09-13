@@ -405,6 +405,16 @@ func TestPersistentRecoveryCleansInterruptedTemporaryRun(t *testing.T) {
 	req, _ := localFixture(t)
 	r := testRunner(t, "timeout", time.Minute)
 	r.RecoveryDir = t.TempDir()
+	dryRunRoot := filepath.Join(r.RecoveryDir, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := os.MkdirTemp(dryRunRoot, "run-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(artifacts) })
+	r.StateDir = artifacts
 	outerOutput := filepath.Join(t.TempDir(), "findings.json")
 	t.Setenv("PRQUEUE_OUTPUT", outerOutput)
 	t.Setenv("PRQUEUE_INPUT", "outer review input")
@@ -436,6 +446,9 @@ func TestPersistentRecoveryCleansInterruptedTemporaryRun(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	if o.Version != 3 || o.ArtifactDir != r.StateDir {
+		t.Fatalf("split ownership was not persisted: %+v", o)
+	}
 	if _, err := os.Stat(filepath.Join(r.StateDir, "runs", req.ID, "agent-metadata.json")); err != nil {
 		t.Fatal("temporary diagnostics missing:", err)
 	}
@@ -458,6 +471,9 @@ func TestPersistentRecoveryCleansInterruptedTemporaryRun(t *testing.T) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("recovery artifact remains at %s: %v", path, err)
 		}
+	}
+	if _, err := os.Stat(r.StateDir); !os.IsNotExist(err) {
+		t.Fatalf("temporary diagnostic root remains: %v", err)
 	}
 }
 
