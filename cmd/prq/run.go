@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -114,10 +115,11 @@ func (a *app) runReviews(ctx context.Context, args []string) (any, error) {
 	defer s.Close()
 	agent := runner.Runner{StateDir: workDir, Agent: cfg.Agent}
 	if !*dry {
-		if _, err := agent.Cleanup(ctx); err != nil {
-			return nil, fmt.Errorf("clean orphaned worktrees: %w", err)
+		_, cleanupErr := agent.Cleanup(ctx)
+		if cleanupErr != nil {
+			cleanupErr = fmt.Errorf("clean orphaned worktrees: %w", cleanupErr)
 		}
-		if err := s.FailInterruptedRuns(ctx); err != nil {
+		if err := errors.Join(cleanupErr, s.FailInterruptedRuns(ctx)); err != nil {
 			return nil, err
 		}
 	}
