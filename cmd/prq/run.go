@@ -137,7 +137,12 @@ func (a *app) runReviews(ctx context.Context, args []string) (result any, result
 			}
 		}
 	} else if completionErr := queue.FinishRun(ctx, a.paths.State, r, a.notifications); completionErr != nil {
-		fmt.Fprintf(a.errOut, "Run completed; notification/summary warning: %s\n", completionErr)
+		var summaryErr *queue.RunSummaryError
+		if errors.As(completionErr, &summaryErr) {
+			err = errors.Join(err, completionErr)
+		} else {
+			fmt.Fprintf(a.errOut, "Run completed; notification warning: %s\n", completionErr)
+		}
 	}
 	return r, err
 }
