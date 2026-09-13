@@ -42,11 +42,23 @@ func (a *app) readQueue(ctx context.Context, command string, args []string) (any
 	q := queue.Service{Store: s, Remote: remote, User: c.GitHub.User, StateDir: a.paths.State}
 	switch command {
 	case "list":
-		return q.List(ctx, repo, status)
+		result, err := q.List(ctx, repo, status)
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
 	case "show":
-		return q.Show(ctx, fs.Arg(0))
+		result, err := q.Show(ctx, fs.Arg(0))
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
 	case "diff":
-		return q.Diff(ctx, fs.Arg(0))
+		result, err := q.Diff(ctx, fs.Arg(0))
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
 	default:
 		return nil, fmt.Errorf("unknown queue read %s", command)
 	}

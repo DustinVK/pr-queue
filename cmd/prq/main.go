@@ -91,6 +91,11 @@ func (a *app) run(ctx context.Context, args []string) int {
 	switch command {
 	case "init", "status", "list", "show", "diff", "approve", "reject", "edit", "publish":
 		err = a.recoverInterrupted(ctx, args)
+		var warning *recoveryWarning
+		if errors.As(err, &warning) {
+			fmt.Fprintf(a.errOut, "Startup recovery warning: %s\n", warning)
+			err = nil
+		}
 	}
 	if err == nil {
 		switch command {
