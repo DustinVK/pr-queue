@@ -53,6 +53,10 @@ func TestInitConsentAndIdempotence(t *testing.T) {
 	if _, err := s.DB.Exec(`INSERT INTO pull_requests(repo,number,head_sha,base_sha,draft,state,updated_at) VALUES('owner/repo',1,'h','b',0,'open','now')`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.DB.Exec(`INSERT INTO review_runs(id,pr_id,head_sha,comparison_key,status,started_at)
+		SELECT 'interrupted',id,head_sha,'key','running',? FROM pull_requests WHERE repo='owner/repo' AND number=1`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
 	s.Close()
 	code, r, diagnostics = invoke(t, paths, "", "init")
 	if code != 0 || !r.OK || diagnostics != "" {
@@ -71,6 +75,10 @@ func TestInitConsentAndIdempotence(t *testing.T) {
 	if err := s.DB.QueryRow("SELECT count(*) FROM pull_requests").Scan(&n); err != nil || n != 1 {
 		t.Fatalf("data lost: %d %v", n, err)
 	}
+	var status string
+	if err := s.DB.QueryRow("SELECT status FROM review_runs WHERE id='interrupted'").Scan(&status); err != nil || status != "failed" {
+		t.Fatalf("init did not recover interrupted run: %q %v", status, err)
+	}
 	for path, mode := range map[string]os.FileMode{paths.Config: 0600, paths.Database: 0600, paths.Consent: 0600, paths.State: 0700, filepath.Dir(paths.Config): 0700} {
 		info, err := os.Stat(path)
 		if err != nil || info.Mode().Perm() != mode {
@@ -86,6 +94,54 @@ func TestInitConsentAndIdempotence(t *testing.T) {
 		if code != 0 || !r.OK {
 			t.Fatalf("read %v: %d %+v", args, code, r)
 		}
+	}
+}
+
+func TestInitCompletesSchemaZeroDatabase(t *testing.T) {
+	paths := config.ForHome(t.TempDir())
+	if err := os.MkdirAll(paths.State, 0700); err != nil {
+		t.Fatal(err)
+	}
+	id := "00000000-0000-4000-8000-000000000001"
+	root := filepath.Join(paths.State, "worktrees", id)
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	owner := root + ".owner.json"
+	body := []byte(`{"version":2,"id":"00000000-0000-4000-8000-000000000001","pid":999999,"started":"previous coordinator"}`)
+	if err := os.WriteFile(owner, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	badOwner := filepath.Join(paths.State, "worktrees", "00000000-0000-4000-8000-000000000002.owner.json")
+	if err := os.WriteFile(badOwner, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.Database, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	code, r, diagnostics := invoke(t, paths, "", "init", "--accept-agent-risk")
+	if code != 0 || !r.OK {
+		t.Fatalf("schema-0 init: %d %+v", code, r)
+	}
+	if !strings.Contains(diagnostics, "Startup recovery warning: clean orphaned worktrees") {
+		t.Fatalf("cleanup warning missing: %q", diagnostics)
+	}
+	s, err := store.OpenReadOnly(t.Context(), paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var version int
+	if err := s.DB.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != store.SchemaVersion {
+		t.Fatalf("schema version %d: %v", version, err)
+	}
+	for _, path := range []string{root, owner} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("init left orphan at %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(badOwner); err != nil {
+		t.Fatal("invalid ownership evidence was not retained:", err)
 	}
 }
 
