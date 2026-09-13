@@ -36,13 +36,23 @@ type Result struct {
 	TimedOut   bool
 }
 type Runner struct {
-	StateDir string
-	Agent    config.Agent
+	StateDir     string
+	Agent        config.Agent
+	launchFaults *launchFaults
 }
 
 func OutputPath(state, id string) string { return filepath.Join(state, "runs", id, "findings.json") }
 
 func (r Runner) Review(ctx context.Context, req Request) (result Result, err error) {
+	agent, err := r.Agent.Normalized()
+	if err != nil {
+		return result, err
+	}
+	resolvedExecutable, err := resolveExecutable(agent.Executable)
+	if err != nil {
+		return result, fmt.Errorf("find agent executable %q: %w", agent.Executable, err)
+	}
+	r.Agent = agent
 	if _, err := uuid.Parse(req.ID); err != nil {
 		return result, err
 	}
@@ -54,9 +64,6 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 	}
 	if err := config.ValidateRepo(req.Input.Repo); err != nil {
 		return result, err
-	}
-	if r.Agent.Timeout <= 0 {
-		return result, fmt.Errorf("agent timeout must be positive")
 	}
 	ctx, cancel := context.WithTimeout(ctx, r.Agent.Timeout)
 	defer cancel()
@@ -77,9 +84,11 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 		return result, err
 	}
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		if e := removeWorktree(cleanupCtx, root); e != nil {
+		var cleanupFailure *launchCleanupError
+		if errors.As(err, &cleanupFailure) {
+			return
+		}
+		if e := removeWorktree(root); e != nil {
 			err = errors.Join(err, e)
 		}
 	}()
@@ -91,6 +100,10 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 	}
 	result.OutputPath = OutputPath(r.StateDir, req.ID)
 	result.LogPath = filepath.Join(diagnostics, "agent.jsonl")
+	scratch := filepath.Join(diagnostics, "scratch")
+	if err := localfs.PrivateDir(scratch); err != nil {
+		return result, err
+	}
 	bare := filepath.Join(root, "repo.git")
 	checkout := filepath.Join(root, "checkout")
 	if _, err := git(ctx, "", "init", "--bare", bare); err != nil {
@@ -118,7 +131,7 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 	sort.Strings(paths)
 	for _, path := range paths {
 		f := req.Diff.Files[path]
-		fmt.Fprintf(&diff, "File: %s\n%s\n", path, f.Patch)
+		fmt.Fprintf(&diff, "File: %q\n%s\n", path, f.Patch)
 		if f.Error != "" {
 			fmt.Fprintf(&diff, "Anchor validation unavailable: %s\n", f.Error)
 		}
@@ -126,7 +139,17 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 	if err := os.WriteFile(diffPath, []byte(diff.String()), 0600); err != nil {
 		return result, err
 	}
-	prompt := Prompt(req.Input, req.Comparison.BaseSHA, result.OutputPath, diffPath)
+	schemaPath := filepath.Join(diagnostics, "findings-schema.json")
+	if agent.Provider == config.ProviderCodex {
+		if err := WriteOutputSchema(schemaPath, req.Input); err != nil {
+			return result, err
+		}
+	}
+	invocation, err := BuildInvocation(agent.Provider, req.ID, req.Input, req.Comparison, InvocationPaths{Output: result.OutputPath, Diff: diffPath, Scratch: scratch, Schema: schemaPath})
+	if err != nil {
+		return result, err
+	}
+	prompt := invocation.Prompt
 	if err := os.WriteFile(filepath.Join(diagnostics, "prompt.txt"), []byte(prompt), 0600); err != nil {
 		return result, err
 	}
@@ -147,45 +170,53 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 		return result, err
 	}
 	defer stderr.Close()
-	args := []string{"-p", "--verbose", "--output-format", "stream-json", "--no-session-persistence", "--session-id", req.ID, "--dangerously-skip-permissions"}
-	cmd := exec.CommandContext(ctx, r.Agent.Executable, args...)
+	metadataPath := filepath.Join(diagnostics, MetadataFilename)
+	metadata := PreparedMetadata(req.ID, req.Input, req.Comparison, agent.Provider, agent.Executable, resolvedExecutable, invocation.Args)
+	if err := WritePreparedAgentMetadata(metadataPath, metadata); err != nil {
+		return result, err
+	}
+	process, err := newGatedProcess(ctx, resolvedExecutable, invocation.Args)
+	if err != nil {
+		return result, err
+	}
+	cmd := process.cmd
 	cmd.Dir = checkout
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Env = agentEnv(result.OutputPath, req.Input)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return killGroup(cmd.Process.Pid) }
-	cmd.WaitDelay = 2 * time.Second
-	owner.Starting = true
-	if err := saveOwner(root, owner); err != nil {
-		return result, err
+	afterRelease := func() error {
+		metadata.MarkReleased()
+		return WriteAgentMetadata(metadataPath, metadata)
 	}
-	if err := cmd.Start(); err != nil {
-		return result, err
-	}
-	owner.AgentPID = cmd.Process.Pid
-	owner.AgentStart, err = processStart(ctx, owner.AgentPID)
-	if err != nil {
-		killGroup(cmd.Process.Pid)
-		cmd.Wait()
-		return result, err
-	}
-	owner.Starting = false
-	if err := saveOwner(root, owner); err != nil {
-		killGroup(cmd.Process.Pid)
-		cmd.Wait()
+	if err := process.start(root, &owner, afterRelease, r.launchFaults); err != nil {
 		return result, err
 	}
 	runErr := cmd.Wait()
-	_ = killGroup(cmd.Process.Pid) // Also stop any ordinary leftover child processes.
-	if ctx.Err() != nil {
-		return result, ctx.Err()
-	}
-	if runErr != nil {
-		return result, fmt.Errorf("agent failed (see %s): %w", result.LogPath, runErr)
+	cleanupErr := killGroup(cmd.Process.Pid) // Also stop any ordinary leftover child processes.
+	if cleanupErr != nil {
+		return result, &launchCleanupError{err: cleanupErr}
 	}
 	if err := stdout.Sync(); err != nil {
+		return result, err
+	}
+	var observed *ObservedIdentity
+	logReader, openErr := os.Open(result.LogPath)
+	var closeErr error
+	if openErr == nil {
+		observed = ObservedIdentityFromJSONLReader(agent.Provider, logReader)
+		closeErr = logReader.Close()
+	}
+	readErr := errors.Join(openErr, closeErr)
+	metadata.MarkFinished(observed)
+	metadataErr := WriteAgentMetadata(metadataPath, metadata)
+	if ctx.Err() != nil {
+		return result, errors.Join(ctx.Err(), readErr, metadataErr)
+	}
+	if runErr != nil {
+		return result, errors.Join(fmt.Errorf("agent failed (see %s): %w", result.LogPath, runErr), readErr, metadataErr)
+	}
+	if err := errors.Join(readErr, metadataErr); err != nil {
 		return result, err
 	}
 	head, err := git(ctx, "", "-C", checkout, "rev-parse", "HEAD")
@@ -209,23 +240,21 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 	if strings.TrimSpace(string(head)) != req.Input.HeadSHA {
 		return result, fmt.Errorf("agent changed the reviewed commit")
 	}
-	info, err := os.Lstat(result.OutputPath)
-	if err != nil {
-		return result, fmt.Errorf("agent did not write findings.json: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return result, fmt.Errorf("findings output must be a regular file")
-	}
-	if err := os.Chmod(result.OutputPath, 0600); err != nil {
-		return result, err
-	}
-	result.Document, err = findings.DecodeFile(result.OutputPath, req.Input)
+	result.Document, err = DecodeProviderOutput(result.OutputPath, req.Input)
 	return result, err
+}
+
+func resolveExecutable(configured string) (string, error) {
+	resolved, err := exec.LookPath(configured)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Abs(resolved)
 }
 
 func agentEnv(output string, input findings.Input) []string {
 	var env []string
-	for _, v := range os.Environ() {
+	for _, v := range repositoryEnv() {
 		key, _, _ := strings.Cut(v, "=")
 		if key == "GH_TOKEN" || key == "GITHUB_TOKEN" || key == "GH_ENTERPRISE_TOKEN" || key == "GITHUB_ENTERPRISE_TOKEN" || strings.HasPrefix(key, "PRQUEUE_") {
 			continue
@@ -234,6 +263,29 @@ func agentEnv(output string, input findings.Input) []string {
 	}
 	data, _ := json.Marshal(input)
 	return append(env, "PRQUEUE_OUTPUT="+output, "PRQUEUE_INPUT="+string(data))
+}
+
+// A hook or caller may export context for its own repository. Neither Git nor
+// the agent should carry that context into the disposable review checkout.
+// Keep global configuration and transport/authentication settings available.
+func repositoryEnv() []string {
+	var env []string
+	for _, v := range os.Environ() {
+		key, _, _ := strings.Cut(v, "=")
+		switch key {
+		case "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+			"GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE",
+			"GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE",
+			"GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+			"GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM":
+			continue
+		}
+		if strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+			continue
+		}
+		env = append(env, v)
+	}
+	return env
 }
 
 func killGroup(pid int) error {
@@ -253,7 +305,7 @@ func git(ctx context.Context, bare string, args ...string) ([]byte, error) {
 		fixed = append(fixed, "--git-dir", bare)
 	}
 	cmd := exec.CommandContext(ctx, "git", append(fixed, args...)...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(repositoryEnv(), "GIT_TERMINAL_PROMPT=0")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return killGroup(cmd.Process.Pid) }
 	cmd.WaitDelay = 2 * time.Second

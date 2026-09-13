@@ -3,28 +3,32 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/DustinVK/pr-queue/internal/localfs"
 	"github.com/google/uuid"
 )
 
 type owner struct {
+	Version    int    `json:"version,omitempty"`
 	ID         string `json:"id"`
 	PID        int    `json:"pid"`
 	Started    string `json:"started"`
 	AgentPID   int    `json:"agent_pid,omitempty"`
 	AgentStart string `json:"agent_start,omitempty"`
 	Starting   bool   `json:"starting_agent,omitempty"`
+	Released   bool   `json:"agent_released,omitempty"`
 }
 
 func newOwner(id string) (owner, error) {
-	o := owner{ID: id, PID: os.Getpid()}
+	o := owner{Version: 2, ID: id, PID: os.Getpid()}
 	var err error
 	o.Started, err = processStart(context.Background(), o.PID)
 	if err == nil && o.Started == "" {
@@ -88,61 +92,120 @@ func (r Runner) Cleanup(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	var cleaned []string
+	var problems []error
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".owner.json") {
 			continue
 		}
-		id := strings.TrimSuffix(entry.Name(), ".owner.json")
-		if _, err := uuid.Parse(id); err != nil {
-			return cleaned, fmt.Errorf("unexpected worktree ownership file %s", entry.Name())
-		}
-		root := filepath.Join(base, id)
-		data, err := os.ReadFile(ownerPath(root))
+		id, err := cleanupEntry(ctx, base, entry.Name())
 		if err != nil {
-			return cleaned, err
-		}
-		var o owner
-		if err := json.Unmarshal(data, &o); err != nil {
-			return cleaned, err
-		}
-		if o.ID != id || o.PID < 1 || o.Started == "" {
-			return cleaned, fmt.Errorf("invalid worktree ownership for %s", entry.Name())
-		}
-		stamp, err := processStart(ctx, o.PID)
-		if err != nil {
-			return cleaned, err
-		}
-		if stamp != "" && stamp == o.Started {
+			problems = append(problems, fmt.Errorf("recover %s: %w", entry.Name(), err))
 			continue
 		}
-		if o.Starting {
-			// Cover a coordinator killed between Start and saving the child PID.
-			groups, err := sessionGroups(ctx, o.ID)
-			if err != nil {
-				return cleaned, err
-			}
-			for _, pid := range groups {
-				if err := killGroup(pid); err != nil {
-					return cleaned, err
-				}
-			}
-		} else if o.AgentPID > 1 {
-			stamp, err := processStart(ctx, o.AgentPID)
-			if err != nil {
-				return cleaned, err
-			}
-			if stamp == "" || stamp == o.AgentStart {
-				if err := killGroup(o.AgentPID); err != nil {
-					return cleaned, err
-				}
-			}
+		if id != "" {
+			cleaned = append(cleaned, id)
 		}
-		if err := removeWorktree(ctx, root); err != nil {
-			return cleaned, err
-		}
-		cleaned = append(cleaned, o.ID)
 	}
-	return cleaned, nil
+	return cleaned, errors.Join(problems...)
+}
+
+// Each ownership entry is independent; one failure must not leave other
+// recoverable worktrees or agent groups behind. Errors still block a new run.
+func cleanupEntry(ctx context.Context, base, name string) (string, error) {
+	id := strings.TrimSuffix(name, ".owner.json")
+	if _, err := uuid.Parse(id); err != nil {
+		return "", fmt.Errorf("unexpected worktree ownership file %s", name)
+	}
+	root := filepath.Join(base, id)
+	data, err := os.ReadFile(ownerPath(root))
+	if err != nil {
+		return "", err
+	}
+	var o owner
+	if err := json.Unmarshal(data, &o); err != nil {
+		return "", err
+	}
+	if o.ID != id || o.PID < 1 || o.Started == "" || (o.Version != 0 && o.Version != 2) {
+		return "", fmt.Errorf("invalid worktree ownership for %s", name)
+	}
+	if err := validateAgentOwnership(o); err != nil {
+		return "", fmt.Errorf("invalid worktree ownership for %s: %w", name, err)
+	}
+	stamp, err := processStart(ctx, o.PID)
+	if err != nil {
+		return "", err
+	}
+	if stamp != "" && stamp == o.Started {
+		return "", nil
+	}
+	if o.Version == 0 && o.Starting {
+		// Cover a coordinator killed between Start and saving the child PID.
+		groups, err := sessionGroups(ctx, o.ID)
+		if err != nil {
+			return "", err
+		}
+		for _, pid := range groups {
+			if err := killGroup(pid); err != nil {
+				return "", err
+			}
+		}
+	} else if o.Version == 2 && o.AgentPID > 1 {
+		if o.AgentStart == "" {
+			return "", fmt.Errorf("invalid version 2 agent ownership for %s", name)
+		}
+		stamp, err := processStart(ctx, o.AgentPID)
+		if err != nil {
+			return "", err
+		}
+		if stamp != "" && stamp == o.AgentStart {
+			group, err := syscall.Getpgid(o.AgentPID)
+			if err != nil && !errors.Is(err, syscall.ESRCH) {
+				return "", err
+			}
+			if group == o.AgentPID {
+				if err := killGroup(o.AgentPID); err != nil {
+					return "", err
+				}
+			} else if err == nil {
+				return "", fmt.Errorf("version 2 agent process %d does not lead its process group", o.AgentPID)
+			}
+		}
+	} else if o.Version == 0 && o.AgentPID > 1 {
+		stamp, err := processStart(ctx, o.AgentPID)
+		if err != nil {
+			return "", err
+		}
+		// A group can outlive its leader, and stale metadata can survive a
+		// reboot or PID reuse. Absence is not evidence that the group is ours.
+		if stamp != "" && stamp == o.AgentStart {
+			if err := killGroup(o.AgentPID); err != nil {
+				return "", err
+			}
+		}
+	}
+	if err := removeWorktree(root); err != nil {
+		return "", err
+	}
+	return o.ID, nil
+}
+
+func validateAgentOwnership(o owner) error {
+	if o.Version != 2 {
+		return nil
+	}
+	if o.Starting {
+		return fmt.Errorf("version 2 owner contains legacy starting state")
+	}
+	if o.AgentPID == 0 {
+		if o.AgentStart != "" || o.Released {
+			return fmt.Errorf("agent identity is incomplete")
+		}
+		return nil
+	}
+	if o.AgentPID < 2 || o.AgentStart == "" {
+		return fmt.Errorf("agent identity is incomplete")
+	}
+	return nil
 }
 
 func sessionGroups(ctx context.Context, id string) ([]int, error) {
@@ -171,17 +234,9 @@ func sessionGroups(ctx context.Context, id string) ([]int, error) {
 	return groups, nil
 }
 
-func removeWorktree(ctx context.Context, root string) error {
-	bare := filepath.Join(root, "repo.git")
-	checkout := filepath.Join(root, "checkout")
-	if _, err := os.Stat(checkout); err == nil {
-		// Interrupted setup may leave an unregistered checkout. Both the bare
-		// repository and checkout belong to this disposable root, so removing
-		// that root also removes any incomplete internal Git metadata.
-		_, _ = git(ctx, bare, "worktree", "remove", "--force", "--force", checkout)
-	} else if !os.IsNotExist(err) {
-		return err
-	}
+func removeWorktree(root string) error {
+	// The bare repository, worktree registration, and checkout all belong to
+	// this disposable root, including any incomplete setup artifacts.
 	if err := os.RemoveAll(root); err != nil {
 		return err
 	}
