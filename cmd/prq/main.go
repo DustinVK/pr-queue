@@ -132,6 +132,10 @@ func (a *app) run(ctx context.Context, args []string) int {
 		if errors.As(err, &partial) {
 			code = 2
 		}
+		var summaryErr *queue.RunSummaryError
+		if errors.As(err, &summaryErr) {
+			code = 1
+		}
 		r.Error = err.Error()
 		fmt.Fprintln(a.errOut, err)
 	}

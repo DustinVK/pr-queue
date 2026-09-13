@@ -14,6 +14,7 @@ import (
 	"github.com/DustinVK/pr-queue/internal/config"
 	"github.com/DustinVK/pr-queue/internal/findings"
 	"github.com/DustinVK/pr-queue/internal/github"
+	"github.com/DustinVK/pr-queue/internal/queue"
 	"github.com/DustinVK/pr-queue/internal/store"
 	"github.com/google/uuid"
 )
@@ -272,5 +273,15 @@ exit "$status"
 	defer os.Chmod(protected, 0700)
 	if code != 1 {
 		t.Fatalf("artifact cleanup failure was ignored: code=%d stdout=%s", code, out.String())
+	}
+}
+
+func TestRunSummaryPersistenceFailureIsFatal(t *testing.T) {
+	a, _, out := runFixture(t)
+	if err := os.WriteFile(queue.SummaryPath(a.paths.State), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.run(t.Context(), []string{"run", "--json"}); code != 1 {
+		t.Fatalf("invalid run summary was not fatal: code=%d stdout=%s", code, out.String())
 	}
 }

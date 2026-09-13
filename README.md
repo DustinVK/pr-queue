@@ -94,7 +94,7 @@ After each normal run, `run-summary.json` in the state directory records the lat
 
 `run` observes PR state before applying filters and skips an unchanged, successfully reviewed comparison. `run --repo owner/name --pr 482` forces a fresh review, including a draft, but never a closed or merged PR. Failed reviews remain eligible for retry.
 
-Each review keeps `findings.json`, the prompt, and separate agent diagnostics under `~/.local/state/prqueue/runs/<run-id>/`. Worktrees are removed after success or failure. The next normal invocation recovers worktrees from dead coordinators and marks interrupted runs failed; it skips recovery while another run holds the global lock. Dry runs leave persistent run state and artifacts untouched.
+Each review keeps `findings.json`, the prompt, and separate agent diagnostics under `~/.local/state/prqueue/runs/<run-id>/`. Worktrees are removed after success or failure. The next normal invocation recovers worktrees from dead coordinators and marks interrupted runs failed; it skips recovery while another run holds the global lock. Dry runs leave logical queue records and retained review artifacts untouched, but may update lock metadata and SQLite WAL coordination files.
 
 Findings can be `pending`, `approved`, `rejected`, `published`, `obsolete`, or `blocked`. The agent's summary is a separate finding that needs its own approval. Invalid inline anchors remain visible as blocked findings; `edit --as-general` removes the anchor and requires approval of the resulting general finding.
 
@@ -112,7 +112,7 @@ With no approved findings, `COMMENT` does nothing, `REQUEST_CHANGES` refuses, an
 
 Publication snapshots are frozen before sending. If delivery is uncertain, a new publication is blocked until `prq publish owner/name#482 --resume` reconciles the original attempt. It never blindly resends a possibly submitted review. For an uncertain attempt, the `--confirmed-not-sent` recovery override requires manual inspection of the PR; the override sends nothing itself. See [publishing and crash recovery](prqueue-spec.md#7-publishing-and-crash-recovery).
 
-`publish --dry-run` validates and previews the exact request without writing local or remote state. Each preview allocates a candidate recovery marker; a later separate publication allocates its own marker. An existing unresolved publication blocks preview, including an otherwise empty `COMMENT`. `run --dry-run` **does run the agent and can incur model cost**; the coordinator uses temporary files, persists no database changes, makes no GitHub writes, and sends no notification.
+`publish --dry-run` validates and previews the exact request without changing logical queue/publication data or remote state. It may update persistent lock metadata and SQLite WAL coordination files. Each preview allocates a candidate recovery marker; a later separate publication allocates its own marker. An existing unresolved publication blocks preview, including an otherwise empty `COMMENT`. `run --dry-run` **does run the agent and can incur model cost**; the coordinator uses temporary files, persists no logical database changes, makes no GitHub writes, and sends no notification.
 
 Recover an interrupted publication separately from starting a new one:
 

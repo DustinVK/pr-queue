@@ -107,6 +107,11 @@ func TestCompletionCountsOnlyNotificationErrorsAndDryRunIsolation(t *testing.T) 
 	r.Repos[0].Reviews[0].Ingestion.Findings[0].Finding.Body = "PRIVATE FINDING BODY"
 	if err := FinishRun(t.Context(), state, r, sink); err == nil {
 		t.Fatal("notification failure not reported")
+	} else {
+		var summaryErr *RunSummaryError
+		if errors.As(err, &summaryErr) {
+			t.Fatal("notification failure classified as run-summary failure")
+		}
 	}
 	if len(sink.messages) != 1 || strings.Contains(sink.messages[0], "PRIVATE") || !strings.Contains(sink.messages[0], "owner/repo#1") {
 		t.Fatalf("notification leaked content: %v", sink.messages)
@@ -126,5 +131,17 @@ func TestCompletionCountsOnlyNotificationErrorsAndDryRunIsolation(t *testing.T) 
 	after, err := os.ReadFile(SummaryPath(state))
 	if err != nil || string(after) != string(before) || len(sink.messages) != 1 {
 		t.Fatal("dry run updated summary or notified")
+	}
+}
+
+func TestCompletionClassifiesRunSummaryFailure(t *testing.T) {
+	state := t.TempDir()
+	if err := os.WriteFile(SummaryPath(state), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err := FinishRun(t.Context(), state, RunResult{}, nil)
+	var summaryErr *RunSummaryError
+	if !errors.As(err, &summaryErr) {
+		t.Fatalf("run-summary failure was not classified: %v", err)
 	}
 }
