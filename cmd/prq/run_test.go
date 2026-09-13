@@ -208,3 +208,69 @@ func TestStatusRecoversInterruptedRun(t *testing.T) {
 		t.Fatalf("interrupted run: %s %v", status, err)
 	}
 }
+
+func TestRunPreflightFailureStillRecoversInterruptedRun(t *testing.T) {
+	a, _, out := runFixture(t)
+	s, err := store.Open(t.Context(), a.paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	p, _, err := s.Observe(t.Context(), "owner/repo", 1, a.remote.(runRemote).pr.Comparison, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.StartRun(t.Context(), uuid.NewString(), p, "interrupted-output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(a.paths.Config, []byte("not: [valid"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.run(t.Context(), []string{"run", "--json"}); code != 1 {
+		t.Fatalf("invalid config did not fail run: code=%d stdout=%s", code, out.String())
+	}
+	var status string
+	if err := s.DB.QueryRow("SELECT status FROM review_runs WHERE id=?", r.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("preflight failure left interrupted run %q", status)
+	}
+}
+
+func TestRunDryRunReportsArtifactCleanupFailure(t *testing.T) {
+	a, marker, out := runFixture(t)
+	cfg, err := config.Load(a.paths.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := cfg.Agent.Executable + ".inner"
+	if err := os.Rename(cfg.Agent.Executable, inner); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := fmt.Sprintf(`#!/bin/sh
+%q "$@"
+status=$?
+root=$(dirname "$(dirname "$(dirname "$PRQUEUE_OUTPUT")")")
+mkdir "$root/protected"
+touch "$root/protected/file"
+chmod 000 "$root/protected"
+exit "$status"
+`, inner)
+	if err := os.WriteFile(cfg.Agent.Executable, []byte(wrapper), 0700); err != nil {
+		t.Fatal(err)
+	}
+	code := a.run(t.Context(), []string{"run", "--repo", "owner/repo", "--pr", "1", "--dry-run", "--json"})
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workDir := filepath.Dir(filepath.Dir(filepath.Dir(string(data))))
+	protected := filepath.Join(workDir, "protected")
+	defer os.RemoveAll(workDir)
+	defer os.Chmod(protected, 0700)
+	if code != 1 {
+		t.Fatalf("artifact cleanup failure was ignored: code=%d stdout=%s", code, out.String())
+	}
+}
