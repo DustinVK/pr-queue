@@ -20,25 +20,27 @@ func (w *recoveryWarning) Unwrap() error { return w.cause }
 
 // Recover on the next invocation without preventing other commands during a run.
 // Dry runs must not update persistent run records or remove persistent artifacts.
-func (a *app) recoverInterrupted(ctx context.Context, args []string) error {
+func (a *app) recoverInterrupted(ctx context.Context, command string, args []string) error {
 	dryRun := false
-	for _, arg := range args {
-		if arg == "--" {
-			break
-		}
-		option := strings.TrimLeft(arg, "-")
-		if !strings.HasPrefix(arg, "-") {
-			continue
-		}
-		if option == "dry-run" {
-			dryRun = true
-			continue
-		}
-		name, value, hasValue := strings.Cut(option, "=")
-		if name == "dry-run" && hasValue {
-			dry, err := strconv.ParseBool(value)
-			if err == nil {
-				dryRun = dry
+	if command == "publish" {
+		for _, arg := range args {
+			if arg == "--" {
+				break
+			}
+			option := strings.TrimLeft(arg, "-")
+			if !strings.HasPrefix(arg, "-") {
+				continue
+			}
+			if option == "dry-run" {
+				dryRun = true
+				continue
+			}
+			name, value, hasValue := strings.Cut(option, "=")
+			if name == "dry-run" && hasValue {
+				dry, err := strconv.ParseBool(value)
+				if err == nil {
+					dryRun = dry
+				}
 			}
 		}
 	}
