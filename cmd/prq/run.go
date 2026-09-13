@@ -18,7 +18,7 @@ import (
 	"github.com/DustinVK/pr-queue/internal/store"
 )
 
-func (a *app) runReviews(ctx context.Context, args []string) (any, error) {
+func (a *app) runReviews(ctx context.Context, args []string) (result any, resultErr error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	repo := fs.String("repo", "", "repository")
@@ -46,6 +46,22 @@ func (a *app) runReviews(ctx context.Context, args []string) (any, error) {
 		return nil, err
 	}
 	defer l.Close()
+	var s *store.Store
+	workDir := a.paths.State
+	if !*dry {
+		s, err = store.Open(ctx, a.paths.Database)
+		if err != nil {
+			return nil, err
+		}
+		defer s.Close()
+		_, cleanupErr := (runner.Runner{StateDir: workDir}).Cleanup(ctx)
+		if cleanupErr != nil {
+			cleanupErr = fmt.Errorf("clean orphaned worktrees: %w", cleanupErr)
+		}
+		if err := errors.Join(cleanupErr, s.FailInterruptedRuns(ctx)); err != nil {
+			return nil, err
+		}
+	}
 	cfg, err := config.Load(a.paths.Config)
 	if err != nil {
 		return nil, err
@@ -88,8 +104,6 @@ func (a *app) runReviews(ctx context.Context, args []string) (any, error) {
 	if _, err := remote.Identity(ctx, cfg.GitHub.User); err != nil {
 		return nil, err
 	}
-	var s *store.Store
-	workDir := a.paths.State
 	if *dry {
 		source, err := store.OpenReadOnly(ctx, a.paths.Database)
 		if err != nil {
@@ -105,24 +119,14 @@ func (a *app) runReviews(ctx context.Context, args []string) (any, error) {
 			s.Close()
 			return nil, err
 		}
-		defer os.RemoveAll(workDir)
-	} else {
-		s, err = store.Open(ctx, a.paths.Database)
-		if err != nil {
-			return nil, err
-		}
+		defer func() {
+			if err := os.RemoveAll(workDir); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("remove dry-run artifacts: %w", err))
+			}
+		}()
+		defer s.Close()
 	}
-	defer s.Close()
 	agent := runner.Runner{StateDir: workDir, Agent: cfg.Agent}
-	if !*dry {
-		_, cleanupErr := agent.Cleanup(ctx)
-		if cleanupErr != nil {
-			cleanupErr = fmt.Errorf("clean orphaned worktrees: %w", cleanupErr)
-		}
-		if err := errors.Join(cleanupErr, s.FailInterruptedRuns(ctx)); err != nil {
-			return nil, err
-		}
-	}
 	coordinator := queue.Coordinator{Store: s, Remote: remote, Reviewer: agent, StateDir: a.paths.State, WorkDir: workDir, Parallel: cfg.Agent.MaxParallelReviews, Source: a.source}
 	r, err := coordinator.Run(ctx, repos, *pr)
 	r.DryRun = *dry
