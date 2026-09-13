@@ -7,7 +7,10 @@ It runs once when invoked, reviews PRs in fresh Git worktrees, and keeps the rev
 **Status:** all eight implementation phases are complete and reviewed. Offline acceptance checks and a controlled real-GitHub/Claude review trial passed; see the [validation record](docs/phase8-validation.md) for coverage and limitations.
 
 - [V1 specification](prqueue-spec.md): the source of truth for behavior.
+- [How it works](docs/how-it-works.md): the review flow, Claude invocation, and invalid-output handling.
 - [Implementation plan](IMPLEMENTATION_PLAN.md): phases, validation, and review checkpoints.
+- [Phases 1–7 handoff](docs/phase-1-7-handoff.md): architecture decisions, regression history, and PR-stack context for contributors; see [AGENTS.md](AGENTS.md) for repository guidance.
+- [Launchd polling specification](docs/launchd-polling-spec.md): the next planned extension, with setup, operating behavior, and delivery phases; the [implementation handoff](docs/launchd-implementation-handoff.md) maps the work to code and tests.
 - [Deferred work](FUTURE.md): features outside v1.
 
 ## Requirements
@@ -132,7 +135,7 @@ Claude Code retains full user permissions using `--dangerously-skip-permissions`
 
 Both agents remain trusted local code. A worktree is not a sandbox, and Codex's command policy does not isolate its entire process, loaded instructions, configured tools, or model connection. Agents are instructed not to edit source, commit, push, or invoke `gh`; ambient authentication can still exist. The approval guarantee applies to prqueue's publisher, including during dry runs.
 
-Docker isolation, a web UI, scheduling, additional providers, provider fallback, and remote notifications are deferred. The existing [LaunchAgent example](com.dustinvk.prqueue.plist) is optional future scheduling material and is not installed by `init`.
+Automated polling is the [next planned extension](docs/launchd-polling-spec.md), using a per-user LaunchAgent around `prq run`. Its management commands are not implemented yet. The existing [LaunchAgent example](com.dustinvk.prqueue.plist) is not installed by `init`; the new specification describes its planned replacement. Docker isolation, a web UI, other agents, and remote notifications remain deferred.
 
 ## Development
 

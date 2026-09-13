@@ -16,7 +16,7 @@ Deferred work for [the v1 spec](prqueue-spec.md), with the reason each item is o
 
 **Web UI.** A thin layer over `internal/queue` once CLI friction is actually felt rather than assumed in advance.
 
-**Scheduling** (launchd on the Mac, a timer on a future headless host). Wrap the one-shot binary after manual operation works; the existing `com.dustinvk.prqueue.plist` is an optional example. Headless deployment also needs a supported notification path.
+**Scheduling — next planned extension.** The [launchd polling specification](docs/launchd-polling-spec.md) defines a per-user Mac LaunchAgent around the existing one-shot binary, installation/status/removal commands, and three implementation phases with review gates. It is not implemented yet; the existing `com.dustinvk.prqueue.plist` remains an optional example until that work replaces it. A timer on a future headless host remains deferred and also needs a supported notification path.
 
 **Multi-agent support** (local-model escalation, provider failover). Explicit selection of Claude or Codex is supported. Combining reviewers and automatic fallback remain deferred pending experience with their findings on real PRs — see §14 of [the v1 spec](prqueue-spec.md).
 
