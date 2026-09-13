@@ -17,14 +17,15 @@ import (
 )
 
 type owner struct {
-	Version    int    `json:"version,omitempty"`
-	ID         string `json:"id"`
-	PID        int    `json:"pid"`
-	Started    string `json:"started"`
-	AgentPID   int    `json:"agent_pid,omitempty"`
-	AgentStart string `json:"agent_start,omitempty"`
-	Starting   bool   `json:"starting_agent,omitempty"`
-	Released   bool   `json:"agent_released,omitempty"`
+	Version     int    `json:"version,omitempty"`
+	ID          string `json:"id"`
+	PID         int    `json:"pid"`
+	Started     string `json:"started"`
+	AgentPID    int    `json:"agent_pid,omitempty"`
+	AgentStart  string `json:"agent_start,omitempty"`
+	Starting    bool   `json:"starting_agent,omitempty"`
+	Released    bool   `json:"agent_released,omitempty"`
+	ArtifactDir string `json:"artifact_dir,omitempty"`
 }
 
 func newOwner(id string) (owner, error) {
@@ -46,6 +47,17 @@ func saveOwner(root string, o owner) error {
 }
 
 func ownerPath(root string) string { return root + ".owner.json" }
+
+func (r Runner) recoveryDir() string {
+	if r.RecoveryDir != "" {
+		return r.RecoveryDir
+	}
+	return r.StateDir
+}
+
+func (r Runner) separateRecoveryDir() bool {
+	return filepath.Clean(r.recoveryDir()) != filepath.Clean(r.StateDir)
+}
 
 // Reserve ownership before creating anything that might need crash recovery.
 func reserveOwner(root string, o owner) error {
@@ -83,21 +95,20 @@ func processStart(ctx context.Context, pid int) (string, error) {
 // Cleanup is called with the global run lock held. It never treats a leftover
 // metadata file as evidence of a live process, and compares start times for PID reuse.
 func (r Runner) Cleanup(ctx context.Context) ([]string, error) {
-	base := filepath.Join(r.StateDir, "worktrees")
+	recoveryDir := r.recoveryDir()
+	base := filepath.Join(recoveryDir, "worktrees")
 	entries, err := os.ReadDir(base)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 	var cleaned []string
 	var problems []error
+	protected := recordedArtifactDirs(recoveryDir, base, entries)
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".owner.json") {
 			continue
 		}
-		id, err := cleanupEntry(ctx, base, entry.Name())
+		id, err := cleanupEntry(ctx, recoveryDir, base, entry.Name())
 		if err != nil {
 			problems = append(problems, fmt.Errorf("recover %s: %w", entry.Name(), err))
 			continue
@@ -106,12 +117,84 @@ func (r Runner) Cleanup(ctx context.Context) ([]string, error) {
 			cleaned = append(cleaned, id)
 		}
 	}
+	if err := cleanupEmptyDryRuns(recoveryDir, protected); err != nil {
+		problems = append(problems, err)
+	}
 	return cleaned, errors.Join(problems...)
+}
+
+func recordedArtifactDirs(recoveryDir, base string, entries []os.DirEntry) map[string]bool {
+	protected := map[string]bool{}
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".owner.json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(base, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var o owner
+		if json.Unmarshal(data, &o) == nil && o.Version == 3 && validateArtifactDirPath(recoveryDir, o.ArtifactDir) == nil {
+			protected[o.ArtifactDir] = true
+		}
+	}
+	return protected
+}
+
+func cleanupEmptyDryRuns(recoveryDir string, protected map[string]bool) error {
+	root := filepath.Join(filepath.Clean(recoveryDir), "dry-runs")
+	if err := validateArtifactRoot(recoveryDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	var problems []error
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "run-") || name == "run-" {
+			continue
+		}
+		path := filepath.Join(root, name)
+		if protected[path] {
+			continue
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			problems = append(problems, fmt.Errorf("inspect empty dry-run artifact %s: %w", name, err))
+			continue
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			problems = append(problems, fmt.Errorf("empty dry-run artifact %s is not a directory", name))
+			continue
+		}
+		if info.Mode().Perm() != 0700 {
+			problems = append(problems, fmt.Errorf("empty dry-run artifact %s is not private", name))
+			continue
+		}
+		children, err := os.ReadDir(path)
+		if err != nil {
+			problems = append(problems, fmt.Errorf("inspect empty dry-run artifact %s: %w", name, err))
+			continue
+		}
+		if len(children) != 0 {
+			problems = append(problems, fmt.Errorf("unowned dry-run artifact %s is not empty", name))
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			problems = append(problems, fmt.Errorf("remove empty dry-run artifact %s: %w", name, err))
+		}
+	}
+	return errors.Join(problems...)
 }
 
 // Each ownership entry is independent; one failure must not leave other
 // recoverable worktrees or agent groups behind. Errors still block a new run.
-func cleanupEntry(ctx context.Context, base, name string) (string, error) {
+func cleanupEntry(ctx context.Context, recoveryDir, base, name string) (string, error) {
 	id := strings.TrimSuffix(name, ".owner.json")
 	if _, err := uuid.Parse(id); err != nil {
 		return "", fmt.Errorf("unexpected worktree ownership file %s", name)
@@ -125,10 +208,7 @@ func cleanupEntry(ctx context.Context, base, name string) (string, error) {
 	if err := json.Unmarshal(data, &o); err != nil {
 		return "", err
 	}
-	if o.ID != id || o.PID < 1 || o.Started == "" || (o.Version != 0 && o.Version != 2) {
-		return "", fmt.Errorf("invalid worktree ownership for %s", name)
-	}
-	if err := validateAgentOwnership(o); err != nil {
+	if err := validateOwner(recoveryDir, id, o); err != nil {
 		return "", fmt.Errorf("invalid worktree ownership for %s: %w", name, err)
 	}
 	stamp, err := processStart(ctx, o.PID)
@@ -149,9 +229,9 @@ func cleanupEntry(ctx context.Context, base, name string) (string, error) {
 				return "", err
 			}
 		}
-	} else if o.Version == 2 && o.AgentPID > 1 {
+	} else if (o.Version == 2 || o.Version == 3) && o.AgentPID > 1 {
 		if o.AgentStart == "" {
-			return "", fmt.Errorf("invalid version 2 agent ownership for %s", name)
+			return "", fmt.Errorf("invalid versioned agent ownership for %s", name)
 		}
 		stamp, err := processStart(ctx, o.AgentPID)
 		if err != nil {
@@ -167,7 +247,7 @@ func cleanupEntry(ctx context.Context, base, name string) (string, error) {
 					return "", err
 				}
 			} else if err == nil {
-				return "", fmt.Errorf("version 2 agent process %d does not lead its process group", o.AgentPID)
+				return "", fmt.Errorf("versioned agent process %d does not lead its process group", o.AgentPID)
 			}
 		}
 	} else if o.Version == 0 && o.AgentPID > 1 {
@@ -183,18 +263,26 @@ func cleanupEntry(ctx context.Context, base, name string) (string, error) {
 			}
 		}
 	}
-	if err := removeWorktree(root); err != nil {
+	if err := removeWorktreeRoot(root); err != nil {
+		return "", err
+	}
+	if o.Version == 3 {
+		if err := os.RemoveAll(o.ArtifactDir); err != nil {
+			return "", err
+		}
+	}
+	if err := removeOwner(root); err != nil {
 		return "", err
 	}
 	return o.ID, nil
 }
 
 func validateAgentOwnership(o owner) error {
-	if o.Version != 2 {
+	if o.Version != 2 && o.Version != 3 {
 		return nil
 	}
 	if o.Starting {
-		return fmt.Errorf("version 2 owner contains legacy starting state")
+		return fmt.Errorf("versioned owner contains legacy starting state")
 	}
 	if o.AgentPID == 0 {
 		if o.AgentStart != "" || o.Released {
@@ -206,6 +294,111 @@ func validateAgentOwnership(o owner) error {
 		return fmt.Errorf("agent identity is incomplete")
 	}
 	return nil
+}
+
+func validateOwner(recoveryDir, id string, o owner) error {
+	if o.ID != id || o.PID < 1 || o.Started == "" || (o.Version != 0 && o.Version != 2 && o.Version != 3) {
+		return fmt.Errorf("owner identity is invalid")
+	}
+	if err := validateAgentOwnership(o); err != nil {
+		return err
+	}
+	return validateArtifactOwnership(recoveryDir, o)
+}
+
+func validateArtifactOwnership(recoveryDir string, o owner) error {
+	if o.Version != 3 {
+		if o.ArtifactDir != "" {
+			return fmt.Errorf("version %d owner contains an artifact directory", o.Version)
+		}
+		return nil
+	}
+	if err := validateArtifactDirPath(recoveryDir, o.ArtifactDir); err != nil {
+		return err
+	}
+	info, err := os.Lstat(o.ArtifactDir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := validateArtifactRoot(recoveryDir); err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("artifact path is not a directory")
+	}
+	if info.Mode().Perm() != 0700 {
+		return fmt.Errorf("artifact directory is not private")
+	}
+	return nil
+}
+
+func validateArtifactDirPath(recoveryDir, dir string) error {
+	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
+		return fmt.Errorf("artifact directory must be an absolute clean path")
+	}
+	root := filepath.Join(filepath.Clean(recoveryDir), "dry-runs")
+	name := filepath.Base(dir)
+	if filepath.Dir(dir) != root || !strings.HasPrefix(name, "run-") || name == "run-" {
+		return fmt.Errorf("artifact directory is outside the recovery-owned dry-run root")
+	}
+	return nil
+}
+
+func validateArtifactRoot(recoveryDir string) error {
+	root := filepath.Join(filepath.Clean(recoveryDir), "dry-runs")
+	info, err := os.Lstat(root)
+	if err != nil {
+		return fmt.Errorf("inspect dry-run artifact root: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("dry-run artifact root is not a directory")
+	}
+	if info.Mode().Perm() != 0700 {
+		return fmt.Errorf("dry-run artifact root is not private")
+	}
+	return nil
+}
+
+// ReleaseArtifactOwnership removes a completed split-root review's persistent
+// record only after its temporary artifact directory has been removed. If the
+// worktree remains, recovery still owns it and the record is retained.
+func (r Runner) ReleaseArtifactOwnership(id string) error {
+	if _, err := uuid.Parse(id); err != nil {
+		return err
+	}
+	root := filepath.Join(r.recoveryDir(), "worktrees", id)
+	if _, err := os.Lstat(root); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	data, err := os.ReadFile(ownerPath(root))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var o owner
+	if err := json.Unmarshal(data, &o); err != nil {
+		return err
+	}
+	if err := validateOwner(r.recoveryDir(), id, o); err != nil {
+		return fmt.Errorf("invalid completed artifact ownership for %s: %w", id, err)
+	}
+	if o.Version != 3 || filepath.Clean(o.ArtifactDir) != filepath.Clean(r.StateDir) {
+		return fmt.Errorf("invalid completed artifact ownership for %s", id)
+	}
+	if _, err := os.Lstat(o.ArtifactDir); !os.IsNotExist(err) {
+		if err == nil {
+			return fmt.Errorf("artifact directory still exists for %s", id)
+		}
+		return err
+	}
+	return removeOwner(root)
 }
 
 func sessionGroups(ctx context.Context, id string) ([]int, error) {
@@ -237,9 +430,17 @@ func sessionGroups(ctx context.Context, id string) ([]int, error) {
 func removeWorktree(root string) error {
 	// The bare repository, worktree registration, and checkout all belong to
 	// this disposable root, including any incomplete setup artifacts.
-	if err := os.RemoveAll(root); err != nil {
+	if err := removeWorktreeRoot(root); err != nil {
 		return err
 	}
+	return removeOwner(root)
+}
+
+func removeWorktreeRoot(root string) error {
+	return os.RemoveAll(root)
+}
+
+func removeOwner(root string) error {
 	if err := os.Remove(ownerPath(root)); err != nil && !os.IsNotExist(err) {
 		return err
 	}

@@ -35,6 +35,13 @@ type RunSummary struct {
 	NotificationError string              `json:"notification_error,omitempty"`
 }
 
+// RunSummaryError identifies a failure to load or persist run-summary.json.
+// Notification delivery errors are intentionally not wrapped in this type.
+type RunSummaryError struct{ cause error }
+
+func (e *RunSummaryError) Error() string { return e.cause.Error() }
+func (e *RunSummaryError) Unwrap() error { return e.cause }
+
 func SummaryPath(state string) string { return filepath.Join(state, "run-summary.json") }
 func LoadRunSummary(state string) (RunSummary, error) {
 	s := RunSummary{SchemaVersion: 1, Passes: map[string]RepoPass{}, FailureSignatures: map[string]string{}}
@@ -62,7 +69,7 @@ func FinishRun(ctx context.Context, state string, r RunResult, sink notify.Sink)
 	}
 	s, err := LoadRunSummary(state)
 	if err != nil {
-		return err
+		return &RunSummaryError{cause: err}
 	}
 	newFailure := false
 	refs := map[string]bool{}
@@ -150,5 +157,9 @@ func FinishRun(ctx context.Context, state string, r RunResult, sink notify.Sink)
 	if err == nil {
 		err = localfs.Replace(SummaryPath(state), append(data, '\n'))
 	}
-	return errors.Join(notificationErr, err)
+	var summaryErr error
+	if err != nil {
+		summaryErr = &RunSummaryError{cause: err}
+	}
+	return errors.Join(notificationErr, summaryErr)
 }

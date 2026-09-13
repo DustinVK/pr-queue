@@ -24,7 +24,7 @@ func TestMain(m *testing.M) {
 		if err := json.Unmarshal([]byte(os.Getenv("PRQ_TEST_REQUEST")), &req); err != nil {
 			panic(err)
 		}
-		r := Runner{StateDir: os.Getenv("PRQ_TEST_STATE"), Agent: config.Agent{Executable: os.Args[0], Timeout: time.Minute}}
+		r := Runner{StateDir: os.Getenv("PRQ_TEST_STATE"), RecoveryDir: os.Getenv("PRQ_TEST_RECOVERY_STATE"), Agent: config.Agent{Executable: os.Args[0], Timeout: time.Minute}}
 		_, err := r.Review(context.Background(), req)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -363,7 +363,7 @@ func TestCleanupAfterCoordinatorKilled(t *testing.T) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0])
 	// This child is a coordinator, even when go test runs inside a review agent.
-	cmd.Env = append(os.Environ(), "PRQUEUE_OUTPUT=", "PRQUEUE_INPUT=", "PRQ_TEST_COORDINATOR=1", "PRQ_TEST_STATE="+r.StateDir, "PRQ_TEST_REQUEST="+string(data))
+	cmd.Env = append(os.Environ(), "PRQUEUE_OUTPUT=", "PRQUEUE_INPUT=", "PRQ_TEST_COORDINATOR=1", "PRQ_TEST_STATE="+r.StateDir, "PRQ_TEST_RECOVERY_STATE=", "PRQ_TEST_REQUEST="+string(data))
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -398,6 +398,82 @@ func TestCleanupAfterCoordinatorKilled(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(outerOutput), "child.pid")); !os.IsNotExist(err) {
 		t.Fatal("test wrote diagnostics into the enclosing review output directory")
+	}
+}
+
+func TestPersistentRecoveryCleansInterruptedTemporaryRun(t *testing.T) {
+	req, _ := localFixture(t)
+	r := testRunner(t, "timeout", time.Minute)
+	r.RecoveryDir = t.TempDir()
+	dryRunRoot := filepath.Join(r.RecoveryDir, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := os.MkdirTemp(dryRunRoot, "run-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(artifacts) })
+	r.StateDir = artifacts
+	outerOutput := filepath.Join(t.TempDir(), "findings.json")
+	t.Setenv("PRQUEUE_OUTPUT", outerOutput)
+	t.Setenv("PRQUEUE_INPUT", "outer review input")
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0])
+	cmd.Env = append(os.Environ(), "PRQUEUE_OUTPUT=", "PRQUEUE_INPUT=", "PRQ_TEST_COORDINATOR=1", "PRQ_TEST_STATE="+r.StateDir, "PRQ_TEST_RECOVERY_STATE="+r.RecoveryDir, "PRQ_TEST_REQUEST="+string(data))
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+	root := filepath.Join(r.RecoveryDir, "worktrees", req.ID)
+	var o owner
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ownerData, _ := os.ReadFile(ownerPath(root))
+		o = owner{}
+		_ = json.Unmarshal(ownerData, &o)
+		if o.AgentPID > 0 && o.Released {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("agent was not released")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if o.Version != 3 || o.ArtifactDir != r.StateDir {
+		t.Fatalf("split ownership was not persisted: %+v", o)
+	}
+	if _, err := os.Stat(filepath.Join(r.StateDir, "runs", req.ID, "agent-metadata.json")); err != nil {
+		t.Fatal("temporary diagnostics missing:", err)
+	}
+	if _, err := os.Stat(filepath.Join(r.RecoveryDir, "runs", req.ID)); !os.IsNotExist(err) {
+		t.Fatal("diagnostics were retained with recovery ownership")
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = cmd.Process.Wait()
+	cleaned, err := (Runner{StateDir: r.RecoveryDir}).Cleanup(t.Context())
+	if err != nil || len(cleaned) != 1 || cleaned[0] != req.ID {
+		t.Fatalf("persistent recovery: %v %v", cleaned, err)
+	}
+	stamp, err := processStart(t.Context(), o.AgentPID)
+	if err != nil || stamp != "" {
+		t.Fatalf("agent survived persistent recovery: %s %v", stamp, err)
+	}
+	for _, path := range []string{root, ownerPath(root)} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("recovery artifact remains at %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(r.StateDir); !os.IsNotExist(err) {
+		t.Fatalf("temporary diagnostic root remains: %v", err)
 	}
 }
 

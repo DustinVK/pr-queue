@@ -248,6 +248,322 @@ func TestCleanupRejectsMalformedVersion2OwnershipBeforeLiveOwnerCheck(t *testing
 	}
 }
 
+func TestCleanupRetriesPartiallyRemovedTemporaryArtifacts(t *testing.T) {
+	recovery := t.TempDir()
+	dryRunRoot := filepath.Join(recovery, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := os.MkdirTemp(dryRunRoot, "run-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(artifacts) })
+	id := uuid.NewString()
+	diagnostics := filepath.Join(artifacts, "runs", id)
+	if err := os.MkdirAll(filepath.Join(diagnostics, "scratch"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"agent-metadata.json": "metadata",
+		"comparison.diff":     "diff",
+	} {
+		if err := os.WriteFile(filepath.Join(diagnostics, name), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Simulate an interrupted RemoveAll: some entries are gone, diagnostics
+	// remain, and only the persistent version-3 owner survives outside the tree.
+	if err := os.Remove(filepath.Join(diagnostics, "comparison.diff")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(diagnostics, "scratch")); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(recovery, "worktrees", id)
+	o, err := newOwner(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.Version = 3
+	o.Started = "previous coordinator"
+	o.ArtifactDir = artifacts
+	if err := saveOwner(root, o); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := (Runner{StateDir: recovery}).Cleanup(t.Context())
+	if err != nil || len(cleaned) != 1 || cleaned[0] != id {
+		t.Fatalf("retry partial artifact cleanup: %v %v", cleaned, err)
+	}
+	for _, path := range []string{ownerPath(root), artifacts} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("retried artifact remains at %s: %v", path, err)
+		}
+	}
+	if cleaned, err := (Runner{StateDir: recovery}).Cleanup(t.Context()); err != nil || len(cleaned) != 0 {
+		t.Fatalf("completed retry was not idempotent: %v %v", cleaned, err)
+	}
+}
+
+func TestCleanupRemovesEmptyPreOwnerDryRunDirectory(t *testing.T) {
+	state := t.TempDir()
+	dryRunRoot := filepath.Join(state, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(dryRunRoot, "run-pre-owner")
+	if err := os.Mkdir(orphan, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := (Runner{StateDir: state}).Cleanup(t.Context())
+	if err != nil || len(cleaned) != 0 {
+		t.Fatalf("clean empty pre-owner directory: %v %v", cleaned, err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("pre-owner dry-run directory remains: %v", err)
+	}
+}
+
+func TestCleanupRejectsUnsafeUnownedDryRunDirectories(t *testing.T) {
+	state := t.TempDir()
+	dryRunRoot := filepath.Join(state, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	external := t.TempDir()
+	unsafe := []string{
+		filepath.Join(dryRunRoot, "run-symlink"),
+		filepath.Join(dryRunRoot, "run-public"),
+		filepath.Join(dryRunRoot, "run-nonempty"),
+	}
+	if err := os.Symlink(external, unsafe[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(unsafe[1], 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unsafe[1], 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(unsafe[2], 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unsafe[2], "diagnostic"), []byte("retain"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := (Runner{StateDir: state}).Cleanup(t.Context())
+	if err == nil || len(cleaned) != 0 {
+		t.Fatalf("unsafe unowned directories accepted: %v %v", cleaned, err)
+	}
+	for _, path := range unsafe {
+		if _, statErr := os.Lstat(path); statErr != nil {
+			t.Fatalf("unsafe directory was removed at %s: %v", path, statErr)
+		}
+	}
+	if _, err := os.Stat(external); err != nil {
+		t.Fatal("symlink target was affected:", err)
+	}
+}
+
+func TestCleanupPreservesEmptyArtifactDirectoryForLiveOwner(t *testing.T) {
+	state := t.TempDir()
+	dryRunRoot := filepath.Join(state, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := os.MkdirTemp(dryRunRoot, "run-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.NewString()
+	root := filepath.Join(state, "worktrees", id)
+	o, err := newOwner(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.Version = 3
+	o.ArtifactDir = artifacts
+	if err := saveOwner(root, o); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := (Runner{StateDir: state}).Cleanup(t.Context())
+	if err != nil || len(cleaned) != 0 {
+		t.Fatalf("cleanup with live owner: %v %v", cleaned, err)
+	}
+	for _, path := range []string{artifacts, ownerPath(root)} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("live ownership artifact removed at %s: %v", path, err)
+		}
+	}
+}
+
+func TestCleanupRejectsSymlinkedTemporaryArtifactRoot(t *testing.T) {
+	recovery := t.TempDir()
+	external := t.TempDir()
+	if err := os.Symlink(external, filepath.Join(recovery, "dry-runs")); err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.NewString()
+	artifacts := filepath.Join(recovery, "dry-runs", "run-owned")
+	if err := os.Mkdir(artifacts, 0700); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(recovery, "worktrees", id)
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	o, err := newOwner(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.Version = 3
+	o.Started = "previous coordinator"
+	o.ArtifactDir = artifacts
+	if err := saveOwner(root, o); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := (Runner{StateDir: recovery}).Cleanup(t.Context())
+	if err == nil || len(cleaned) != 0 {
+		t.Fatalf("symlinked artifact root accepted: %v %v", cleaned, err)
+	}
+	for _, path := range []string{root, ownerPath(root), filepath.Join(external, "run-owned")} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("failed validation removed %s: %v", path, err)
+		}
+	}
+}
+
+func TestCleanupFinalizesSharedTemporaryArtifactsAfterAllOwners(t *testing.T) {
+	recovery := t.TempDir()
+	dryRunRoot := filepath.Join(recovery, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := os.MkdirTemp(dryRunRoot, "run-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(artifacts) })
+	var ids []string
+	for range 2 {
+		id := uuid.NewString()
+		ids = append(ids, id)
+		root := filepath.Join(recovery, "worktrees", id)
+		if err := os.MkdirAll(root, 0700); err != nil {
+			t.Fatal(err)
+		}
+		o, err := newOwner(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.Version = 3
+		o.Started = "previous coordinator"
+		o.ArtifactDir = artifacts
+		if err := saveOwner(root, o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	badID := uuid.NewString()
+	badOwner := ownerPath(filepath.Join(recovery, "worktrees", badID))
+	if err := os.WriteFile(badOwner, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := (Runner{StateDir: recovery}).Cleanup(t.Context())
+	if err == nil || !strings.Contains(err.Error(), badID) || len(cleaned) != len(ids) {
+		t.Fatalf("shared artifact cleanup: %v %v", cleaned, err)
+	}
+	if _, err := os.Stat(artifacts); !os.IsNotExist(err) {
+		t.Fatalf("shared artifact root remains: %v", err)
+	}
+	for _, id := range ids {
+		root := filepath.Join(recovery, "worktrees", id)
+		for _, path := range []string{root, ownerPath(root)} {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("shared recovery artifact remains at %s: %v", path, err)
+			}
+		}
+	}
+	if _, err := os.Stat(badOwner); err != nil {
+		t.Fatal("unrelated invalid owner was not retained:", err)
+	}
+}
+
+func TestReleaseArtifactOwnershipHandlesSharedRemovedRoot(t *testing.T) {
+	recovery := t.TempDir()
+	dryRunRoot := filepath.Join(recovery, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := os.MkdirTemp(dryRunRoot, "run-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for range 2 {
+		id := uuid.NewString()
+		ids = append(ids, id)
+		o, err := newOwner(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.Version = 3
+		o.ArtifactDir = artifacts
+		root := filepath.Join(recovery, "worktrees", id)
+		if err := os.MkdirAll(filepath.Dir(root), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := saveOwner(root, o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.RemoveAll(artifacts); err != nil {
+		t.Fatal(err)
+	}
+	r := Runner{StateDir: artifacts, RecoveryDir: recovery}
+	for _, id := range ids {
+		if err := r.ReleaseArtifactOwnership(id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(ownerPath(filepath.Join(recovery, "worktrees", id))); !os.IsNotExist(err) {
+			t.Fatalf("completed owner remains for %s: %v", id, err)
+		}
+	}
+}
+
+func TestReleaseArtifactOwnershipRejectsMalformedOwner(t *testing.T) {
+	recovery := t.TempDir()
+	dryRunRoot := filepath.Join(recovery, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := os.MkdirTemp(dryRunRoot, "run-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.NewString()
+	root := filepath.Join(recovery, "worktrees", id)
+	o, err := newOwner(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.Version = 3
+	o.Started = ""
+	o.ArtifactDir = artifacts
+	if err := saveOwner(root, o); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(artifacts); err != nil {
+		t.Fatal(err)
+	}
+	r := Runner{StateDir: artifacts, RecoveryDir: recovery}
+	if err := r.ReleaseArtifactOwnership(id); err == nil {
+		t.Fatal("malformed completed owner was accepted")
+	}
+	if _, err := os.Stat(ownerPath(root)); err != nil {
+		t.Fatal("malformed completed owner was removed:", err)
+	}
+}
+
 func TestCleanupContinuesAfterIndependentEntryFailures(t *testing.T) {
 	r := Runner{StateDir: t.TempDir()}
 	base := filepath.Join(r.StateDir, "worktrees")
