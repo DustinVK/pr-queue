@@ -305,6 +305,98 @@ func TestCleanupRetriesPartiallyRemovedTemporaryArtifacts(t *testing.T) {
 	}
 }
 
+func TestCleanupRemovesEmptyPreOwnerDryRunDirectory(t *testing.T) {
+	state := t.TempDir()
+	dryRunRoot := filepath.Join(state, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(dryRunRoot, "run-pre-owner")
+	if err := os.Mkdir(orphan, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := (Runner{StateDir: state}).Cleanup(t.Context())
+	if err != nil || len(cleaned) != 0 {
+		t.Fatalf("clean empty pre-owner directory: %v %v", cleaned, err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("pre-owner dry-run directory remains: %v", err)
+	}
+}
+
+func TestCleanupRejectsUnsafeUnownedDryRunDirectories(t *testing.T) {
+	state := t.TempDir()
+	dryRunRoot := filepath.Join(state, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	external := t.TempDir()
+	unsafe := []string{
+		filepath.Join(dryRunRoot, "run-symlink"),
+		filepath.Join(dryRunRoot, "run-public"),
+		filepath.Join(dryRunRoot, "run-nonempty"),
+	}
+	if err := os.Symlink(external, unsafe[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(unsafe[1], 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unsafe[1], 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(unsafe[2], 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unsafe[2], "diagnostic"), []byte("retain"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := (Runner{StateDir: state}).Cleanup(t.Context())
+	if err == nil || len(cleaned) != 0 {
+		t.Fatalf("unsafe unowned directories accepted: %v %v", cleaned, err)
+	}
+	for _, path := range unsafe {
+		if _, statErr := os.Lstat(path); statErr != nil {
+			t.Fatalf("unsafe directory was removed at %s: %v", path, statErr)
+		}
+	}
+	if _, err := os.Stat(external); err != nil {
+		t.Fatal("symlink target was affected:", err)
+	}
+}
+
+func TestCleanupPreservesEmptyArtifactDirectoryForLiveOwner(t *testing.T) {
+	state := t.TempDir()
+	dryRunRoot := filepath.Join(state, "dry-runs")
+	if err := os.MkdirAll(dryRunRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := os.MkdirTemp(dryRunRoot, "run-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.NewString()
+	root := filepath.Join(state, "worktrees", id)
+	o, err := newOwner(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.Version = 3
+	o.ArtifactDir = artifacts
+	if err := saveOwner(root, o); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := (Runner{StateDir: state}).Cleanup(t.Context())
+	if err != nil || len(cleaned) != 0 {
+		t.Fatalf("cleanup with live owner: %v %v", cleaned, err)
+	}
+	for _, path := range []string{artifacts, ownerPath(root)} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("live ownership artifact removed at %s: %v", path, err)
+		}
+	}
+}
+
 func TestCleanupRejectsSymlinkedTemporaryArtifactRoot(t *testing.T) {
 	recovery := t.TempDir()
 	external := t.TempDir()
