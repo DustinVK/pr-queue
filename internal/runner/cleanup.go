@@ -95,21 +95,20 @@ func processStart(ctx context.Context, pid int) (string, error) {
 // Cleanup is called with the global run lock held. It never treats a leftover
 // metadata file as evidence of a live process, and compares start times for PID reuse.
 func (r Runner) Cleanup(ctx context.Context) ([]string, error) {
-	base := filepath.Join(r.recoveryDir(), "worktrees")
+	recoveryDir := r.recoveryDir()
+	base := filepath.Join(recoveryDir, "worktrees")
 	entries, err := os.ReadDir(base)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 	var cleaned []string
 	var problems []error
+	protected := recordedArtifactDirs(recoveryDir, base, entries)
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".owner.json") {
 			continue
 		}
-		id, err := cleanupEntry(ctx, r.recoveryDir(), base, entry.Name())
+		id, err := cleanupEntry(ctx, recoveryDir, base, entry.Name())
 		if err != nil {
 			problems = append(problems, fmt.Errorf("recover %s: %w", entry.Name(), err))
 			continue
@@ -118,7 +117,79 @@ func (r Runner) Cleanup(ctx context.Context) ([]string, error) {
 			cleaned = append(cleaned, id)
 		}
 	}
+	if err := cleanupEmptyDryRuns(recoveryDir, protected); err != nil {
+		problems = append(problems, err)
+	}
 	return cleaned, errors.Join(problems...)
+}
+
+func recordedArtifactDirs(recoveryDir, base string, entries []os.DirEntry) map[string]bool {
+	protected := map[string]bool{}
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".owner.json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(base, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var o owner
+		if json.Unmarshal(data, &o) == nil && o.Version == 3 && validateArtifactDirPath(recoveryDir, o.ArtifactDir) == nil {
+			protected[o.ArtifactDir] = true
+		}
+	}
+	return protected
+}
+
+func cleanupEmptyDryRuns(recoveryDir string, protected map[string]bool) error {
+	root := filepath.Join(filepath.Clean(recoveryDir), "dry-runs")
+	if err := validateArtifactRoot(recoveryDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	var problems []error
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "run-") || name == "run-" {
+			continue
+		}
+		path := filepath.Join(root, name)
+		if protected[path] {
+			continue
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			problems = append(problems, fmt.Errorf("inspect empty dry-run artifact %s: %w", name, err))
+			continue
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			problems = append(problems, fmt.Errorf("empty dry-run artifact %s is not a directory", name))
+			continue
+		}
+		if info.Mode().Perm() != 0700 {
+			problems = append(problems, fmt.Errorf("empty dry-run artifact %s is not private", name))
+			continue
+		}
+		children, err := os.ReadDir(path)
+		if err != nil {
+			problems = append(problems, fmt.Errorf("inspect empty dry-run artifact %s: %w", name, err))
+			continue
+		}
+		if len(children) != 0 {
+			problems = append(problems, fmt.Errorf("unowned dry-run artifact %s is not empty", name))
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			problems = append(problems, fmt.Errorf("remove empty dry-run artifact %s: %w", name, err))
+		}
+	}
+	return errors.Join(problems...)
 }
 
 // Each ownership entry is independent; one failure must not leave other
