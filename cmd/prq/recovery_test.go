@@ -59,3 +59,44 @@ func TestRecoveryWarningDoesNotDisableOtherCommands(t *testing.T) {
 		t.Fatalf("orphan cleanup did not refuse a new review: code=%d stdout=%s stderr=%s", code, out.String(), diagnostics.String())
 	}
 }
+
+func TestRunCleanupFailureStillFailsInterruptedRuns(t *testing.T) {
+	a, _, out := runFixture(t)
+	s, err := store.Open(t.Context(), a.paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _, err := s.Observe(t.Context(), "owner/repo", 1, a.remote.(runRemote).pr.Comparison, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.StartRun(t.Context(), uuid.NewString(), p, "interrupted-output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	owners := filepath.Join(a.paths.State, "worktrees")
+	if err := os.MkdirAll(owners, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(owners, uuid.NewString()+".owner.json"), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.run(t.Context(), []string{"run", "--json"}); code != 1 {
+		t.Fatalf("cleanup failure did not refuse run: code=%d stdout=%s", code, out.String())
+	}
+	s, err = store.OpenReadOnly(t.Context(), a.paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var status string
+	if err := s.DB.QueryRow("SELECT status FROM review_runs WHERE id=?", r.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("interrupted run remained %q after cleanup failure", status)
+	}
+}
