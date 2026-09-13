@@ -179,6 +179,24 @@ func TestLostResponseAndSenderDeathRecoverAfterPRCloses(t *testing.T) {
 	}
 }
 
+func TestLostResponseDismissedApprovalReconciles(t *testing.T) {
+	q, remote, fs := publicationService(t)
+	approveTestItems(t, q, fs)
+	remote.mode = "accepted response lost"
+	if _, err := q.Publish(t.Context(), "owner/repo#1", "APPROVE"); err == nil {
+		t.Fatal("expected lost response")
+	}
+	remote.reviews[0].State = "DISMISSED"
+	remote.reviews[0].DismissedState = "APPROVED"
+	r, err := q.ResumePublication(t.Context(), "owner/repo#1", false)
+	if err != nil || r.Publication == nil || r.Publication.Status != "published" || remote.posts != 1 {
+		t.Fatalf("dismissed approval recovery: %+v posts=%d %v", r, remote.posts, err)
+	}
+	if !strings.Contains(","+strings.Join(remote.reads, ",")+",", ",review,") {
+		t.Fatalf("dismissed marker match was not fetched by ID: %v", remote.reads)
+	}
+}
+
 func TestCrashBeforePOSTIsNeverBlindlyResent(t *testing.T) {
 	q, remote, fs := publicationService(t)
 	approveTestItems(t, q, fs)

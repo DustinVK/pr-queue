@@ -171,7 +171,14 @@ func (q Service) ResumePublication(ctx context.Context, ref string, confirmedNot
 			return q.publicationFailure(*p, fmt.Errorf("multiple reviews contain publication marker %s", p.Marker), true, "")
 		}
 		if len(matches) == 1 {
-			review = &matches[0]
+			matched := matches[0]
+			if matched.State == "DISMISSED" {
+				matched, err = remote.FetchReview(ctx, repo, pr, matched.ID)
+				if err != nil {
+					return q.publicationFailure(*p, err, true, matched.ID)
+				}
+			}
+			review = &matched
 		}
 	}
 	if review == nil {
