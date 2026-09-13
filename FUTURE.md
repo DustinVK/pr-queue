@@ -2,7 +2,7 @@
 
 Deferred work for [the v1 spec](prqueue-spec.md), with the reason each item is outside the current scope. Nothing here gates reviewing a real PR with v1.
 
-**Docker / sandboxed execution mode.** Process isolation, credential separation, resource limits, and restricted mounts are deferred. V1 trusts local agent execution and enforces approval only in its own publisher; removing an environment token does not remove ambient `gh` authentication. An isolated runner would need to keep host credentials out of the agent's reach. Revisit when reviewing untrusted contributions becomes a real use case.
+**Whole-process isolation.** Credential separation, resource limits, and restricted mounts for the entire agent remain deferred. Codex uses its native command sandbox; Claude retains full-permission execution. Both remain trusted local agents, and prqueue enforces approval only in its own publisher; removing an environment token does not remove ambient `gh` authentication. An isolated runner would need to keep host credentials out of the agent's reach. Revisit when reviewing untrusted contributions becomes a real use case.
 
 **Staged/pending GitHub reviews.** Creating a review without an `event`, editable in GitHub's own UI before someone submits it. Genuinely useful, but it reopens exactly the reconciliation problem v1 sidesteps by publishing in one shot (does the staged draft's comment set match what's currently approved locally, who owns edits made to it from GitHub's side). Worth it once triage volume makes "look it over in the GitHub UI before submitting" a real workflow, not before.
 
@@ -18,6 +18,6 @@ Deferred work for [the v1 spec](prqueue-spec.md), with the reason each item is o
 
 **Scheduling** (launchd on the Mac, a timer on a future headless host). Wrap the one-shot binary after manual operation works; the existing `com.dustinvk.prqueue.plist` is an optional example. Headless deployment also needs a supported notification path.
 
-**Multi-agent support** (local-model escalation, provider failover). Deferred until Claude-only findings quality is measured against real PRs — see §14 of [the v1 spec](prqueue-spec.md).
+**Multi-agent support** (local-model escalation, provider failover). Explicit selection of Claude or Codex is supported. Combining reviewers and automatic fallback remain deferred pending experience with their findings on real PRs — see §14 of [the v1 spec](prqueue-spec.md).
 
 **The 40-scenario acceptance matrix from the full-rigor draft.** Most of those scenarios are real and worth having *eventually* — but as regression tests written against working code, not as a spec to satisfy before code exists. §13 of the v1 spec keeps the eight that protect the core guarantee; the rest can come back as tests once there's something to test.
