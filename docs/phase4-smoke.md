@@ -17,7 +17,7 @@ To deliberately repeat this check (it invokes Claude and can incur model cost):
 ```sh
 smoke_state=$(mktemp -d)
 PRQ_RUNNER_REAL_SMOKE=1 PRQ_SMOKE_STATE="$smoke_state" \
-  go test ./internal/runner -run '^TestManualClaudeSmoke$' -v -count=1
+  go test ./internal/runner -run '^TestManualClaudeSmoke$' -v -count=1 -timeout 20m
 ```
 
 Inspect the printed diagnostic paths and transcript manually afterward. Ordinary test runs skip this check.
