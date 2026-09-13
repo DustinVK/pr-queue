@@ -217,10 +217,17 @@ func (q Service) resumePrepared(ctx context.Context, remote PublishRemote, p sto
 		return PublicationResult{Publication: &p}, err
 	}
 	byID := map[string]store.Finding{}
-	for _, f := range current {
-		byID[f.ID] = f
+	snapshotIDs := map[string]bool{}
+	for _, item := range p.Snapshot.Items {
+		snapshotIDs[item.ID] = true
 	}
 	var stale []string
+	for _, f := range current {
+		byID[f.ID] = f
+		if f.Status == "approved" && !snapshotIDs[f.ID] {
+			stale = append(stale, f.ID)
+		}
+	}
 	for _, item := range p.Snapshot.Items {
 		f, ok := byID[item.ID]
 		if !ok || !item.Matches(f) || diff.Validate(f.Finding) != nil {

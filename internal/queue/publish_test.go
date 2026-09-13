@@ -322,6 +322,42 @@ func TestPreparedSnapshotStalenessIncludesEmptyApproval(t *testing.T) {
 	}
 }
 
+func TestPreparedSnapshotRejectsNewApprovals(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		event string
+		seed  bool
+	}{
+		{name: "comment", event: "COMMENT", seed: true},
+		{name: "empty approval", event: "APPROVE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q, remote, fs := publicationService(t)
+			if tc.seed {
+				if _, err := q.Approve(t.Context(), []string{fs[0].ID}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prepared := prepareTestPublication(t, q, tc.event)
+			if _, err := q.Approve(t.Context(), []string{fs[1].ID}); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := q.ResumePublication(t.Context(), "owner/repo#1", false)
+			if err == nil || remote.posts != 0 {
+				t.Fatalf("stale prepared selection was sent: result=%+v posts=%d err=%v", result, remote.posts, err)
+			}
+			stored, err := q.Store.Publication(t.Context(), prepared.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status != "failed" || stored.Uncertain {
+				t.Fatalf("stale prepared selection not failed definitely: %+v", stored)
+			}
+		})
+	}
+}
+
 func TestResumeIdentityBeforeOtherRemoteOperations(t *testing.T) {
 	q, remote, fs := publicationService(t)
 	approveTestItems(t, q, fs)
