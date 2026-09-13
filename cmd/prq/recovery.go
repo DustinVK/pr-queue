@@ -47,11 +47,6 @@ func (a *app) recoverInterrupted(ctx context.Context, command string, args []str
 	if dryRun {
 		return nil
 	}
-	if _, err := os.Stat(a.paths.Database); os.IsNotExist(err) {
-		return nil
-	} else if err != nil {
-		return err
-	}
 	l, err := lock.Acquire(lock.RunPath(a.paths.State), "recover interrupted run")
 	var busy *lock.BusyError
 	if errors.As(err, &busy) {
@@ -67,6 +62,14 @@ func (a *app) recoverInterrupted(ctx context.Context, command string, args []str
 	}
 	if ctx.Err() != nil {
 		return errors.Join(ctx.Err(), cleanupErr)
+	}
+	if _, err := os.Stat(a.paths.Database); os.IsNotExist(err) {
+		if cleanupErr != nil {
+			return &recoveryWarning{cause: cleanupErr}
+		}
+		return nil
+	} else if err != nil {
+		return errors.Join(cleanupErr, err)
 	}
 	s, err := store.Open(ctx, a.paths.Database)
 	if err != nil {

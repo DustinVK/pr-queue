@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -133,5 +134,32 @@ func TestRejectReasonNamedDryRunDoesNotSkipRecovery(t *testing.T) {
 	}
 	if status != "failed" {
 		t.Fatalf("reason named --dry-run left interrupted run %q", status)
+	}
+}
+
+func TestCommandsCleanOrphansWithoutDatabase(t *testing.T) {
+	for _, args := range [][]string{{"status", "--json"}, {"run", "--json"}} {
+		t.Run(args[0], func(t *testing.T) {
+			a, _, out := runFixture(t)
+			id := uuid.NewString()
+			root := filepath.Join(a.paths.State, "worktrees", id)
+			if err := os.MkdirAll(root, 0700); err != nil {
+				t.Fatal(err)
+			}
+			owner := filepath.Join(a.paths.State, "worktrees", id+".owner.json")
+			body := fmt.Sprintf(`{"version":2,"id":%q,"pid":%d,"started":"previous coordinator"}`, id, os.Getpid())
+			if err := os.WriteFile(owner, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(a.paths.Database, a.paths.Database+".missing"); err != nil {
+				t.Fatal(err)
+			}
+			if code := a.run(t.Context(), args); code != 1 {
+				t.Fatalf("missing database: code=%d stdout=%s", code, out.String())
+			}
+			if _, err := os.Stat(owner); !os.IsNotExist(err) {
+				t.Fatalf("orphan owner remains without database: %v", err)
+			}
+		})
 	}
 }

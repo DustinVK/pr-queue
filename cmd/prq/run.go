@@ -49,15 +49,15 @@ func (a *app) runReviews(ctx context.Context, args []string) (result any, result
 	var s *store.Store
 	workDir := a.paths.State
 	if !*dry {
-		s, err = store.Open(ctx, a.paths.Database)
-		if err != nil {
-			return nil, err
-		}
-		defer s.Close()
 		_, cleanupErr := (runner.Runner{StateDir: workDir}).Cleanup(ctx)
 		if cleanupErr != nil {
 			cleanupErr = fmt.Errorf("clean orphaned worktrees: %w", cleanupErr)
 		}
+		s, err = store.Open(ctx, a.paths.Database)
+		if err != nil {
+			return nil, errors.Join(cleanupErr, err)
+		}
+		defer s.Close()
 		if err := errors.Join(cleanupErr, s.FailInterruptedRuns(ctx)); err != nil {
 			return nil, err
 		}
