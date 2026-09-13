@@ -94,6 +94,37 @@ func TestPublicationPreviewLeavesAllFiveTablesUnchanged(t *testing.T) {
 	}
 }
 
+func TestPublishDryRunFalsePerformsStartupRecovery(t *testing.T) {
+	for _, dryFlag := range []string{"--dry-run=false", "-dry-run=false", "--dry-run=0"} {
+		t.Run(dryFlag, func(t *testing.T) {
+			a, _, out := runFixture(t)
+			s, err := store.Open(t.Context(), a.paths.Database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			p, _, err := s.Observe(t.Context(), "owner/repo", 1, a.remote.(runRemote).pr.Comparison, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := s.StartRun(t.Context(), uuid.NewString(), p, "interrupted-output")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if code := a.run(t.Context(), []string{"publish", "owner/repo#1", "--event", "COMMENT", dryFlag, "--json"}); code != 0 {
+				t.Fatalf("live publish: code=%d stdout=%s", code, out.String())
+			}
+			var status string
+			if err := s.DB.QueryRow("SELECT status FROM review_runs WHERE id=?", r.ID).Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if status != "failed" {
+				t.Fatalf("live %s skipped recovery: %s", dryFlag, status)
+			}
+		})
+	}
+}
+
 func TestPublishNoopNeedsNoPostingClient(t *testing.T) {
 	a, _, out := runFixture(t)
 	if code := a.run(t.Context(), []string{"publish", "owner/repo#1", "--event", "COMMENT", "--json"}); code != 0 {
