@@ -19,12 +19,13 @@ import (
 )
 
 type Review struct {
-	ID          string  `json:"id"`
-	User        string  `json:"user"`
-	CommitID    string  `json:"commit_id"`
-	Body        string  `json:"body"`
-	State       string  `json:"state"`
-	SubmittedAt *string `json:"submitted_at,omitempty"`
+	ID             string  `json:"id"`
+	User           string  `json:"user"`
+	CommitID       string  `json:"commit_id"`
+	Body           string  `json:"body"`
+	State          string  `json:"state"`
+	DismissedState string  `json:"dismissed_state,omitempty"`
+	SubmittedAt    *string `json:"submitted_at,omitempty"`
 }
 
 type apiReview struct {
@@ -54,7 +55,11 @@ func (r apiReview) value() (Review, error) {
 
 func (r Review) Matches(user string, request ReviewRequest) error {
 	state := map[string]string{"COMMENT": "COMMENTED", "APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED"}[request.Event]
-	if r.ID == "" || state == "" || r.State != state || !strings.EqualFold(r.User, user) || r.CommitID != request.CommitID || r.Body != request.Body || r.SubmittedAt == nil {
+	actualState := r.State
+	if actualState == "DISMISSED" {
+		actualState = r.DismissedState
+	}
+	if r.ID == "" || state == "" || actualState != state || !strings.EqualFold(r.User, user) || r.CommitID != request.CommitID || r.Body != request.Body || r.SubmittedAt == nil {
 		return fmt.Errorf("review %s does not match snapshot author, commit, submitted event, or exact body", r.ID)
 	}
 	if _, err := time.Parse(time.RFC3339, *r.SubmittedAt); err != nil {
@@ -105,6 +110,11 @@ func (c *Client) FetchReview(ctx context.Context, repo string, pr int, id string
 	if err == nil && r.ID != id {
 		err = fmt.Errorf("GitHub returned a different review ID")
 	}
+	if err == nil {
+		reviews := []Review{r}
+		err = c.addDismissedStates(ctx, repo, pr, reviews)
+		r = reviews[0]
+	}
 	return r, err
 }
 
@@ -145,6 +155,87 @@ func (c *Client) ListReviews(ctx context.Context, repo string, pr int) ([]Review
 	return result, nil
 }
 
+func (c *Client) addDismissedStates(ctx context.Context, repo string, pr int, reviews []Review) error {
+	targets := map[string]bool{}
+	for _, review := range reviews {
+		if review.State == "DISMISSED" {
+			targets[review.ID] = true
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	data, err := c.get(ctx, fmt.Sprintf("repos/%s/issues/%d/events?per_page=100", repo, pr), true)
+	if err != nil {
+		return err
+	}
+	var pages [][]struct {
+		Event           string `json:"event"`
+		DismissedReview *struct {
+			ReviewID json.RawMessage `json:"review_id"`
+			State    string          `json:"state"`
+		} `json:"dismissed_review"`
+	}
+	if err := decode(data, &pages); err != nil {
+		return err
+	}
+	if len(pages) == 0 {
+		return fmt.Errorf("missing paginated issue events response")
+	}
+	dismissed := map[string]string{}
+	for _, page := range pages {
+		if page == nil {
+			return fmt.Errorf("invalid issue events page")
+		}
+		for _, event := range page {
+			if event.Event != "review_dismissed" {
+				continue
+			}
+			if event.DismissedReview == nil {
+				continue
+			}
+			id, err := dismissalReviewID(event.DismissedReview.ReviewID)
+			if err != nil {
+				continue
+			}
+			if !targets[id] {
+				continue
+			}
+			state := strings.ToUpper(event.DismissedReview.State)
+			if state != "COMMENTED" && state != "APPROVED" && state != "CHANGES_REQUESTED" {
+				return fmt.Errorf("invalid previous state for dismissed review %s", id)
+			}
+			if previous, exists := dismissed[id]; exists && previous != state {
+				return fmt.Errorf("conflicting dismissal events for review %s", id)
+			}
+			dismissed[id] = state
+		}
+	}
+	for i := range reviews {
+		if reviews[i].State != "DISMISSED" {
+			continue
+		}
+		state, ok := dismissed[reviews[i].ID]
+		if !ok {
+			return fmt.Errorf("missing dismissal event for review %s", reviews[i].ID)
+		}
+		reviews[i].DismissedState = state
+	}
+	return nil
+}
+
+func dismissalReviewID(raw json.RawMessage) (string, error) {
+	var number int64
+	if err := json.Unmarshal(raw, &number); err == nil && number > 0 {
+		return strconv.FormatInt(number, 10), nil
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil && validReviewID(text) {
+		return text, nil
+	}
+	return "", fmt.Errorf("invalid dismissed review ID")
+}
+
 type SubmittedComment struct {
 	ID               string `json:"id"`
 	ReviewID         string `json:"review_id"`
@@ -173,6 +264,7 @@ func (c *Client) ListReviewComments(ctx context.Context, repo string, pr int, id
 			Login string `json:"login"`
 		} `json:"user"`
 		OriginalCommitID  string  `json:"original_commit_id"`
+		InReplyToID       *int64  `json:"in_reply_to_id"`
 		Body              *string `json:"body"`
 		Path              *string `json:"path"`
 		Side              *string `json:"side"`
@@ -197,6 +289,12 @@ func (c *Client) ListReviewComments(ctx context.Context, repo string, pr int, id
 				return nil, fmt.Errorf("missing or duplicate review comment identity")
 			}
 			seen[raw.ID] = true
+			if raw.InReplyToID != nil {
+				if *raw.InReplyToID < 1 {
+					return nil, fmt.Errorf("invalid review comment reply identity")
+				}
+				continue
+			}
 			reviewID := strconv.FormatInt(raw.ReviewID, 10)
 			if reviewID != id {
 				continue
