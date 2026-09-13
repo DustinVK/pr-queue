@@ -18,6 +18,11 @@ import (
 	"github.com/DustinVK/pr-queue/internal/store"
 )
 
+type dryRunCleanupError struct{ cause error }
+
+func (e *dryRunCleanupError) Error() string { return "remove dry-run artifacts: " + e.cause.Error() }
+func (e *dryRunCleanupError) Unwrap() error { return e.cause }
+
 func (a *app) runReviews(ctx context.Context, args []string) (result any, resultErr error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -121,12 +126,12 @@ func (a *app) runReviews(ctx context.Context, args []string) (result any, result
 		}
 		defer func() {
 			if err := os.RemoveAll(workDir); err != nil {
-				resultErr = errors.Join(resultErr, fmt.Errorf("remove dry-run artifacts: %w", err))
+				resultErr = errors.Join(resultErr, &dryRunCleanupError{cause: err})
 			}
 		}()
 		defer s.Close()
 	}
-	agent := runner.Runner{StateDir: workDir, Agent: cfg.Agent}
+	agent := runner.Runner{StateDir: workDir, RecoveryDir: a.paths.State, Agent: cfg.Agent}
 	coordinator := queue.Coordinator{Store: s, Remote: remote, Reviewer: agent, StateDir: a.paths.State, WorkDir: workDir, Parallel: cfg.Agent.MaxParallelReviews, Source: a.source}
 	r, err := coordinator.Run(ctx, repos, *pr)
 	r.DryRun = *dry

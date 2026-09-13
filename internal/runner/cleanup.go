@@ -47,6 +47,13 @@ func saveOwner(root string, o owner) error {
 
 func ownerPath(root string) string { return root + ".owner.json" }
 
+func (r Runner) recoveryDir() string {
+	if r.RecoveryDir != "" {
+		return r.RecoveryDir
+	}
+	return r.StateDir
+}
+
 // Reserve ownership before creating anything that might need crash recovery.
 func reserveOwner(root string, o owner) error {
 	data, err := json.Marshal(o)
@@ -83,7 +90,7 @@ func processStart(ctx context.Context, pid int) (string, error) {
 // Cleanup is called with the global run lock held. It never treats a leftover
 // metadata file as evidence of a live process, and compares start times for PID reuse.
 func (r Runner) Cleanup(ctx context.Context) ([]string, error) {
-	base := filepath.Join(r.StateDir, "worktrees")
+	base := filepath.Join(r.recoveryDir(), "worktrees")
 	entries, err := os.ReadDir(base)
 	if os.IsNotExist(err) {
 		return nil, nil

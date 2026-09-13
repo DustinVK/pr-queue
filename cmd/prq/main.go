@@ -20,6 +20,7 @@ import (
 	"github.com/DustinVK/pr-queue/internal/lock"
 	"github.com/DustinVK/pr-queue/internal/notify"
 	"github.com/DustinVK/pr-queue/internal/queue"
+	"github.com/DustinVK/pr-queue/internal/runner"
 	"github.com/DustinVK/pr-queue/internal/store"
 )
 
@@ -89,7 +90,7 @@ func (a *app) run(ctx context.Context, args []string) int {
 	var data any
 	var err error
 	switch command {
-	case "init", "status", "list", "show", "diff", "approve", "reject", "edit", "publish":
+	case "status", "list", "show", "diff", "approve", "reject", "edit", "publish":
 		err = a.recoverInterrupted(ctx, command, args)
 		var warning *recoveryWarning
 		if errors.As(err, &warning) {
@@ -141,6 +142,10 @@ func (a *app) run(ctx context.Context, args []string) int {
 		if errors.As(err, &summaryErr) {
 			code = 1
 		}
+		var cleanupErr *dryRunCleanupError
+		if errors.As(err, &cleanupErr) {
+			code = 1
+		}
 		r.Error = err.Error()
 		fmt.Fprintln(a.errOut, err)
 	}
@@ -183,6 +188,16 @@ func (a *app) init(ctx context.Context, args []string) (any, error) {
 		return nil, err
 	}
 	defer l.Close()
+	_, cleanupErr := (runner.Runner{StateDir: a.paths.State}).Cleanup(ctx)
+	if cleanupErr != nil {
+		cleanupErr = fmt.Errorf("clean orphaned worktrees: %w", cleanupErr)
+	}
+	if ctx.Err() != nil {
+		return nil, errors.Join(ctx.Err(), cleanupErr)
+	}
+	if cleanupErr != nil {
+		fmt.Fprintf(a.errOut, "Startup recovery warning: %s\n", cleanupErr)
+	}
 	ack, err := a.paths.Consented()
 	if err != nil {
 		return nil, err
@@ -210,6 +225,9 @@ func (a *app) init(ctx context.Context, args []string) (any, error) {
 	s, err := store.Create(ctx, a.paths.Database)
 	if err != nil {
 		return nil, err
+	}
+	if err = s.FailInterruptedRuns(ctx); err != nil {
+		return nil, errors.Join(err, s.Close())
 	}
 	if err = s.Close(); err != nil {
 		return nil, err

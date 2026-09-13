@@ -36,7 +36,11 @@ type Result struct {
 	TimedOut   bool
 }
 type Runner struct {
-	StateDir     string
+	// StateDir owns retained or temporary per-run diagnostic artifacts.
+	StateDir string
+	// RecoveryDir owns disposable worktrees and their crash-recovery records.
+	// It defaults to StateDir so existing callers retain one-root behavior.
+	RecoveryDir  string
 	Agent        config.Agent
 	launchFaults *launchFaults
 }
@@ -68,7 +72,7 @@ func (r Runner) Review(ctx context.Context, req Request) (result Result, err err
 	ctx, cancel := context.WithTimeout(ctx, r.Agent.Timeout)
 	defer cancel()
 	defer func() { result.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded) }()
-	root := filepath.Join(r.StateDir, "worktrees", req.ID)
+	root := filepath.Join(r.recoveryDir(), "worktrees", req.ID)
 	diagnostics := filepath.Dir(OutputPath(r.StateDir, req.ID))
 	if err := localfs.PrivateDir(filepath.Dir(root)); err != nil {
 		return result, err

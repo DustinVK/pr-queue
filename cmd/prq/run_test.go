@@ -158,6 +158,11 @@ func TestRunDryRunIsolatesAllPersistentState(t *testing.T) {
 	if _, err := os.Stat(filepath.Dir(string(data))); !os.IsNotExist(err) {
 		t.Fatal("temporary output remained")
 	}
+	if entries, err := os.ReadDir(filepath.Join(a.paths.State, "worktrees")); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("dry-run recovery artifacts remained: %v", entries)
+	}
 	var result struct {
 		OK   bool `json:"ok"`
 		Data struct {
@@ -241,38 +246,55 @@ func TestRunPreflightFailureStillRecoversInterruptedRun(t *testing.T) {
 }
 
 func TestRunDryRunReportsArtifactCleanupFailure(t *testing.T) {
-	a, marker, out := runFixture(t)
-	cfg, err := config.Load(a.paths.Config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inner := cfg.Agent.Executable + ".inner"
-	if err := os.Rename(cfg.Agent.Executable, inner); err != nil {
-		t.Fatal(err)
-	}
-	wrapper := fmt.Sprintf(`#!/bin/sh
-%q "$@"
+	for _, tc := range []struct {
+		name      string
+		agentFail bool
+	}{
+		{name: "cleanup only"},
+		{name: "partial and cleanup", agentFail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, marker, out := runFixture(t)
+			cfg, err := config.Load(a.paths.Config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			inner := cfg.Agent.Executable + ".inner"
+			if err := os.Rename(cfg.Agent.Executable, inner); err != nil {
+				t.Fatal(err)
+			}
+			fail := ""
+			if tc.agentFail {
+				fail = "PRQ_TEST_FAIL=1 "
+			}
+			wrapper := fmt.Sprintf(`#!/bin/sh
+%s%q "$@"
 status=$?
 root=$(dirname "$(dirname "$(dirname "$PRQUEUE_OUTPUT")")")
 mkdir "$root/protected"
 touch "$root/protected/file"
 chmod 000 "$root/protected"
 exit "$status"
-`, inner)
-	if err := os.WriteFile(cfg.Agent.Executable, []byte(wrapper), 0700); err != nil {
-		t.Fatal(err)
-	}
-	code := a.run(t.Context(), []string{"run", "--repo", "owner/repo", "--pr", "1", "--dry-run", "--json"})
-	data, err := os.ReadFile(marker)
-	if err != nil {
-		t.Fatal(err)
-	}
-	workDir := filepath.Dir(filepath.Dir(filepath.Dir(string(data))))
-	protected := filepath.Join(workDir, "protected")
-	defer os.RemoveAll(workDir)
-	defer os.Chmod(protected, 0700)
-	if code != 1 {
-		t.Fatalf("artifact cleanup failure was ignored: code=%d stdout=%s", code, out.String())
+	`, fail, inner)
+			if err := os.WriteFile(cfg.Agent.Executable, []byte(wrapper), 0700); err != nil {
+				t.Fatal(err)
+			}
+			code := a.run(t.Context(), []string{"run", "--repo", "owner/repo", "--pr", "1", "--dry-run", "--json"})
+			data, err := os.ReadFile(marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			workDir := filepath.Dir(filepath.Dir(filepath.Dir(string(data))))
+			protected := filepath.Join(workDir, "protected")
+			defer os.RemoveAll(workDir)
+			defer os.Chmod(protected, 0700)
+			if code != 1 {
+				t.Fatalf("artifact cleanup failure was ignored: code=%d stdout=%s", code, out.String())
+			}
+			if tc.agentFail && (!strings.Contains(out.String(), "agent failed") || !strings.Contains(out.String(), "remove dry-run artifacts")) {
+				t.Fatalf("combined failure lost an error: %s", out.String())
+			}
+		})
 	}
 }
 
